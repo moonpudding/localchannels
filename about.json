@@ -1,0 +1,41 @@
+{
+  "_comment": [
+    "Everything shown on Settings > About lives here, so it can be edited",
+    "without touching code. Leave a field as an empty string to hide it from",
+    "the page entirely — nothing here is required.",
+    "",
+    "Bump `version` when you tag a release, and keep it matching the git tag",
+    "(with or without a leading 'v'); the update check compares this against",
+    "the latest GitHub release.",
+    "",
+    "To edit without rebuilding the image, bind-mount your own copy and point",
+    "LOCALCHANNELS_ABOUT at it — see the About section of the README."
+  ],
+
+  "name": "LocalChannels",
+  "version": "1.0.0",
+  "tagline": "Your own video library, with channels.",
+  "description": "A self-hosted web library and player for the videos you already have on disk. Browse by folder, tag and search your collection, resume where you left off, and shuffle a folder or a set of tags into an endless channel.",
+
+  "license": {
+    "name": "MIT",
+    "url": ""
+  },
+
+  "author": "",
+  "homepage": "https://github.com/moonpudding/localchannels",
+
+  "contact": {
+    "email": "",
+    "issues": "https://github.com/moonpudding/localchannels/issues"
+  },
+
+  "repo": {
+    "owner": "moonpudding",
+    "name": "localchannels"
+  },
+
+  "links": [],
+
+  "credits": "Built with FastAPI and SQLite. Metadata and thumbnails come from ffmpeg/ffprobe. Colour themes are adapted from Catppuccin, Nord, Rosé Pine, Gruvbox and Tokyo Night."
+}

@@ -1,0 +1,13 @@
+{
+  "site_name": "LocalChannels",
+  "root_path": "/home/you/Videos",
+  "host": "127.0.0.1",
+  "port": 8000,
+  "default_theme": "mocha",
+  "thumbnail_width": 480,
+  "thumbnail_seek_fraction": 0.20,
+  "video_extensions": [
+    ".mp4", ".mkv", ".webm", ".avi", ".mov",
+    ".m4v", ".flv", ".wmv", ".mpg", ".mpeg", ".ts"
+  ]
+}

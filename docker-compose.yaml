@@ -1,0 +1,40 @@
+services:
+  localchannels:
+    build: .
+    # Or, if you'd rather pull/tag a prebuilt image instead of building:
+    # image: localchannels:latest
+    container_name: localchannels
+    ports:
+      - "8000:8000"
+    volumes:
+      # ── Your video library (read/write) ──
+      # Change the left-hand path to point at your videos.
+      #
+      # Mounted read/write because two features modify the library: deleting a
+      # file from the duplicates page, and writing tags into filenames. Nothing
+      # else touches your videos — indexing, thumbnails and playback are all
+      # read-only operations.
+      #
+      # If you'd rather keep the library untouchable, append `:ro` below. The
+      # app still works; those two features will report a read-only error.
+      - /path/to/your/videos:/videos
+
+      # ── Persisted data: SQLite DB + cached thumbnails ──
+      # Named volume by default. To keep the data visible on the host instead,
+      # comment the next line and uncomment the bind mount below it.
+      - localchannels-data:/data
+      # - ./data:/data
+    environment:
+      LOCALCHANNELS_SITE_NAME: "LocalChannels"
+      LOCALCHANNELS_DEFAULT_THEME: "mocha"
+      # Password protection (off by default). Set BOTH to enable:
+      # LOCALCHANNELS_AUTH_ENABLED: "true"
+      # LOCALCHANNELS_PASSWORD: "change-me"
+      # Optional extra tuning:
+      # LOCALCHANNELS_THUMBNAIL_WIDTH: "480"
+      # LOCALCHANNELS_THUMBNAIL_SEEK_FRACTION: "0.20"
+      # LOCALCHANNELS_VIDEO_EXTENSIONS: ".mp4,.mkv,.webm,.avi,.mov,.m4v,.ts"
+    restart: unless-stopped
+
+volumes:
+  localchannels-data:

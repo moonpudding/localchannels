@@ -1,0 +1,170 @@
+name: Build and publish Docker image
+
+# Releases are cut by pushing a tag: `git tag v1.0.1 && git push origin v1.0.1`.
+# Pushes to main keep :edge current so the latest code is always pullable
+# without cutting a release. Pull requests build but never push.
+on:
+  push:
+    branches: [main]
+    tags: ['v*.*.*']
+    paths-ignore:
+      - 'README.md'
+      - 'LICENSE'
+      - '.gitea/**'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # about.json drives the About page AND the update check, which compares the
+  # running version against the newest GitHub release. If a tag ships with a
+  # stale version in about.json, every user is told an update is available the
+  # moment they install it. Cheaper to fail here than to re-cut the release.
+  check-version:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: about.json version must match the tag
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          file=$(python3 -c "import json;print(json.load(open('about.json'))['version'])")
+          echo "tag=$tag  about.json=$file"
+          if [ "$tag" != "$file" ]; then
+            echo "::error file=about.json::Tag v$tag does not match about.json version $file. Bump about.json and re-tag."
+            exit 1
+          fi
+
+  build:
+    needs: [check-version]
+    # check-version is skipped on branch pushes and PRs; don't block on it.
+    if: always() && (needs.check-version.result == 'success' || needs.check-version.result == 'skipped')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      digest: ${{ steps.build.outputs.digest }}
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      # arm64 covers the Raspberry Pi / ARM NAS boxes this tends to get
+      # self-hosted on. QEMU only matters for the emulated arm64 leg.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # GITHUB_TOKEN is enough to push to GHCR from the repo that owns the
+      # package — no PAT needed. See the notes below the workflow.
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # This is what preserves version history. Tagging v1.0.1 publishes an
+      # immutable :1.0.1 alongside the existing :1.0.0, and moves the rolling
+      # :1.0, :1 and :latest forward. Nothing is ever overwritten, so pinning
+      # to :1.0.0 keeps working forever, :1.0 tracks patches, :1 tracks minors.
+      - name: Extract Docker metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=raw,value=edge,enable={{is_default_branch}}
+            type=ref,event=pr
+          labels: |
+            org.opencontainers.image.title=LocalChannels
+            org.opencontainers.image.description=Self-hosted web library and player for your own video files
+            org.opencontainers.image.licenses=${{ github.event.repository.license.spdx_id }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # Pull what was actually published and confirm it runs. This exists because
+  # a missing about.json shipped once already: the image built and started
+  # perfectly, and the only symptom was the About page quietly falling back to
+  # version 0.0.0.
+  verify:
+    needs: [build]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Start the published image
+        run: |
+          image="${REGISTRY}/${IMAGE_NAME}:${{ needs.build.outputs.version }}"
+          echo "Testing $image"
+          echo "IMAGE=$image" >> "$GITHUB_ENV"
+          docker run -d --name lc -p 8000:8000 "$image"
+
+      - name: Wait for /api/health
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8000/api/health | grep -q '"ok"'; then
+              echo "healthy after ${i}s"; exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::Container never became healthy"
+          docker logs lc
+          exit 1
+
+      - name: about.json is present and served
+        run: |
+          docker exec lc test -f /app/about.json \
+            || { echo "::error::about.json missing from the image"; exit 1; }
+          version=$(curl -fsS http://127.0.0.1:8000/api/about \
+            | python3 -c "import json,sys;print(json.load(sys.stdin)['version'])")
+          echo "reported version: $version"
+          if [ "$version" = "0.0.0" ]; then
+            echo "::error::App reports 0.0.0 — about.json did not load"
+            exit 1
+          fi
+          if [ "${GITHUB_REF_TYPE}" = "tag" ] && [ "$version" != "${GITHUB_REF_NAME#v}" ]; then
+            echo "::error::Image reports $version but tag is ${GITHUB_REF_NAME}"
+            exit 1
+          fi
+
+      - name: Container logs
+        if: always()
+        run: docker logs lc || true
+
+      - name: Clean up
+        if: always()
+        run: docker rm -f lc || true
