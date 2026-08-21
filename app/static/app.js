@@ -472,8 +472,18 @@ async function renderBrowse() {
   const c = main();
   c.innerHTML = "";
   c.appendChild(await indexBanner());
+  const rescanNow = el("button", {
+    class: "btn", title: "Scan the library folder for new or removed files",
+    onClick: async (e) => {
+      const b = e.currentTarget;
+      b.disabled = true;
+      try { await reindex(); } catch (err) { toast("Could not start rescan"); b.disabled = false; }
+    },
+  }, [el("span", { html: ICON.refresh }), "Rescan"]);
   c.appendChild(el("div", { class: "page-head" }, [
     el("h1", { class: "page-title" }, state.path ? state.path.split("/").pop() : "Library"),
+    el("div", { class: "spacer" }),
+    rescanNow,
   ]));
   c.appendChild(crumbs(state.path));
 
@@ -1837,6 +1847,7 @@ async function renderVideo(id) {
     name = (name || "").trim();
     if (!name) return;
     const r = await api.post(`/api/video/${id}/tags`, { name });
+    refreshTagWarning();
     currentTags = r.tags;
     await refreshAllTags();
     renderCurrent(); renderPopular(); renderDatalist(); loadTree();
@@ -2079,6 +2090,25 @@ const SETTINGS_CATS = [
 ];
 let settingsCat = "general";
 
+/* ------------------------------------------------- unwritten tag warning */
+// Tags assigned in the app live only in the database until they're written
+// into filenames. That's easy to forget, and a library restored from the files
+// alone would lose them — so surface it in the toolbar.
+async function refreshTagWarning() {
+  const btn = document.getElementById("tag-warn-btn");
+  if (!btn) return;
+  let r;
+  try { r = await api.get("/api/tags/pending"); }
+  catch (e) { btn.style.display = "none"; return; }   // never block the UI over this
+  if (!r.enabled || !r.pending) { btn.style.display = "none"; return; }
+  const n = r.pending;
+  btn.style.display = "";
+  btn.title = `${n} video${n === 1 ? " has" : "s have"} tags that aren't written into ` +
+    `${n === 1 ? "its filename" : "their filenames"} yet` +
+    (r.skipped ? ` (${r.skipped} more can't be written — open Tags settings for why)` : "") +
+    ". Click to open Tags settings.";
+}
+
 function settingRow(name, hint, control) {
   return el("div", { class: "setting-row" }, [
     el("div", { class: "setting-info" }, [
@@ -2138,12 +2168,34 @@ async function settingsGeneral(body) {
       toast(on ? "Autoplay enabled" : "Autoplay disabled");
     })));
 
+  // Channel order is a server setting, not a browser pref: the play queue and
+  // its "already played this lap" state live in the database.
+  const orderSel = el("select", { class: "theme" }, [
+    el("option", { value: "random" }, "Random"),
+    el("option", { value: "sequential" }, "Sequential (by filename)"),
+  ]);
+  try {
+    const cfg = await api.get("/api/settings");
+    orderSel.value = cfg.channel_order === "sequential" ? "sequential" : "random";
+  } catch (e) { orderSel.value = "random"; }
+  orderSel.addEventListener("change", async (e) => {
+    const value = e.target.value;
+    try {
+      await api.post("/api/settings", { key: "channel_order", value });
+      toast(value === "sequential"
+        ? "Channels play in filename order" : "Channels play in random order");
+    } catch (err) { toast("Could not save that setting"); }
+  });
+  body.appendChild(settingRow("Channel order",
+    "How channel mode picks the next video. Sequential follows filename order; either way each video plays once before the channel loops.",
+    orderSel));
+
   await settingsBackup(body);
   settingsDebug(body);
 }
 
 function settingsDebug(body) {
-  body.appendChild(el("h2", { class: "settings-section-title" }, "Debugging"));
+  body.appendChild(el("h2", { class: "settings-section-title", style: "margin-top:40px" }, "Debugging"));
   body.appendChild(el("p", { class: "settings-section-desc" },
     "Extra diagnostics for troubleshooting. Off by default — leave these alone unless you're chasing a problem."));
 
@@ -2456,6 +2508,18 @@ async function settingsTags(body) {
     "Needs the library mounted read/write.",
     writeBtn));
   body.appendChild(writePanel);
+
+  let warnCfg = "1";
+  try { warnCfg = (await api.get("/api/settings")).warn_unwritten_tags; } catch (e) {}
+  body.appendChild(settingRow("Warn about unwritten tags",
+    "Show a warning in the toolbar when tags have been assigned in the app but not yet written into filenames.",
+    toggleSwitch(warnCfg !== "0", async (on) => {
+      try {
+        await api.post("/api/settings", { key: "warn_unwritten_tags", value: on ? "1" : "0" });
+        toast(on ? "Unwritten-tag warnings enabled" : "Unwritten-tag warnings disabled");
+        refreshTagWarning();
+      } catch (e) { toast("Could not save that setting"); }
+    })));
 
   // ── Manage Tags (the per-tag list, kept last since it can be long) ──
   body.appendChild(el("h2", { class: "settings-section-title", style: "margin-top:40px" }, "Manage Tags"));
@@ -3310,6 +3374,7 @@ function pollIndex() {
 async function reindex() {
   await api.post("/api/reindex");
   toast("Rescanning library…");
+  refreshTagWarning();   // a scan can add or remove tagged files
   if (state.view === "browse") renderBrowse();
   else pollIndex();
 }
@@ -3584,7 +3649,11 @@ async function init() {
     document.title = state.config.site_name;
   }
 
-  document.getElementById("channel-btn").addEventListener("click", () => navigate("channel"));
+  const tagWarnBtn = document.getElementById("tag-warn-btn");
+  if (tagWarnBtn) tagWarnBtn.addEventListener("click", () => {
+    settingsCat = "tags";
+    navigate("settings");
+  });
   document.getElementById("settings-btn").addEventListener("click", () => navigate("settings"));
 
   // Logout button (only visible when password protection is enabled).
@@ -3650,6 +3719,7 @@ async function init() {
   }
 
   window.addEventListener("hashchange", route);
+  refreshTagWarning();
   route(); // render the current hash (or the library root if none)
 }
 

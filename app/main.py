@@ -276,12 +276,14 @@ SETTING_DEFAULTS = {
     "filename_tags_auto": "0",           # "1" to auto-tag on every scan
     "filename_tags_strip_title": "1",    # "1" to hide the tag section in titles
     "backup_include_thumbs": "0",        # "1" to put cached thumbnails in backups
+    "channel_order": "random",           # random | sequential (by filename)
+    "warn_unwritten_tags": "1",          # "1" to flag tags not yet in filenames
     **ai.AI_SETTING_DEFAULTS,            # ai_endpoint, ai_model, ai_frame_mode, ...
 }
 
 # Settings stored as "0"/"1"; anything truthy-looking is normalised on save.
 _BOOL_SETTINGS = {"filename_tags_auto", "filename_tags_strip_title",
-                  "backup_include_thumbs"}
+                  "backup_include_thumbs", "warn_unwritten_tags"}
 
 # Saving any of these changes how titles are derived, so drop the cache.
 _TITLE_SETTINGS = {"filename_tags_strip_title", "filename_tag_brackets"}
@@ -310,6 +312,8 @@ def api_set_setting(payload: dict = Body(...)):
         raise HTTPException(400, "Unknown setting")
     if key == "filename_tag_brackets" and value not in indexer.FILENAME_TAG_BRACKETS:
         raise HTTPException(400, "Invalid bracket type")
+    if key == "channel_order" and value not in ("random", "sequential"):
+        raise HTTPException(400, "Channel order must be 'random' or 'sequential'")
     if key in _BOOL_SETTINGS:
         value = "1" if str(value).strip().lower() in ("1", "true", "yes", "on") else "0"
     if key == "ai_frame_mode" and value not in ("count", "interval"):
@@ -1075,6 +1079,21 @@ def _safe_target(rel_path: str) -> Path:
     return target
 
 
+@app.get("/api/tags/pending")
+def api_tags_pending():
+    """How many videos have tags not yet written into their filenames.
+
+    Cheap counterpart to /api/tags/to-filenames: the UI polls this to decide
+    whether to show the unwritten-tags warning, so it returns counts only and
+    never touches disk beyond the existence checks the plan already does.
+    """
+    with db.get_db() as conn:
+        if db.get_setting(conn, "warn_unwritten_tags", "1") != "1":
+            return {"enabled": False, "pending": 0, "skipped": 0}
+        summary = _plan_summary(_plan_tag_writes(conn))
+    return {"enabled": True, "pending": summary["rename"], "skipped": summary["skipped"]}
+
+
 @app.post("/api/tags/to-filenames")
 def api_tags_to_filenames(payload: dict = Body(default={})):
     """Write each video's tags back into its filename on disk.
@@ -1201,7 +1220,8 @@ def _pool(conn, folders: list[str], tags: list[str]) -> list[int]:
     tags = [t for t in (tags or []) if t.strip()]
 
     if whole_library:
-        return [r["id"] for r in conn.execute("SELECT id FROM videos").fetchall()]
+        return [r["id"] for r in
+                conn.execute("SELECT id FROM videos ORDER BY rel_path").fetchall()]
 
     clauses: list = []
     params: list = []
@@ -1220,14 +1240,23 @@ def _pool(conn, folders: list[str], tags: list[str]) -> list[int]:
         params.extend([t.lower() for t in tags])
     if not clauses:
         return []
-    sql = "SELECT id FROM videos WHERE " + " OR ".join(clauses)
+    # ORDER BY rel_path so sequential channels play in a predictable order;
+    # random mode ignores it, so this costs nothing there.
+    sql = "SELECT id FROM videos WHERE " + " OR ".join(clauses) + " ORDER BY rel_path"
     return [r["id"] for r in conn.execute(sql, params).fetchall()]
 
 
 def _serve_next(conn, key: str, pool: list[int], exclude: Optional[int]) -> dict:
-    """Shuffle-without-replacement pick from a pool, looping when exhausted."""
+    """Pick the next video from a pool, looping when exhausted.
+
+    Both orders track what's been played in channel_played, so a channel
+    resumes where it left off and every video is seen once per lap. The only
+    difference is which of the remaining videos comes next: a random one, or
+    the next by filename after the one just played.
+    """
     if not pool:
         raise HTTPException(404, "No videos match this channel")
+    order = db.get_setting(conn, "channel_order", "random")
     played = {
         r["video_id"] for r in conn.execute(
             "SELECT video_id FROM channel_played WHERE channel_key = ?", (key,)
@@ -1241,7 +1270,17 @@ def _serve_next(conn, key: str, pool: list[int], exclude: Optional[int]) -> dict
         looped = True
     if exclude is not None and len(remaining) > 1 and exclude in remaining:
         remaining = [v for v in remaining if v != exclude]
-    choice = random.choice(remaining)
+
+    if order == "sequential":
+        # pool is already ordered by rel_path. Continue after `exclude` (the
+        # video that just finished) rather than restarting at the top.
+        choice = remaining[0]
+        if exclude is not None and exclude in pool:
+            after = [v for v in pool[pool.index(exclude) + 1:] if v in remaining]
+            if after:
+                choice = after[0]
+    else:
+        choice = random.choice(remaining)
     conn.execute(
         "INSERT OR IGNORE INTO channel_played (channel_key, video_id, played_at) "
         "VALUES (?, ?, ?)",

@@ -688,3 +688,7 @@ select.theme { height: 38px; padding: 0 10px; border-radius: var(--radius);
 .codec-warning .codec-cmd { display: block; padding: 8px 10px; border-radius: 6px;
   background: var(--bg); font-family: var(--font-mono); font-size: 12px;
   white-space: pre-wrap; word-break: break-all; color: var(--text); }
+
+/* Toolbar warning: tags assigned in the app but not yet written to filenames. */
+.btn.icon.tag-warn { color: var(--warning, #d79921); }
+.btn.icon.tag-warn:hover { background: color-mix(in srgb, var(--warning, #d79921) 18%, transparent); }
