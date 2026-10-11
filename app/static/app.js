@@ -132,6 +132,14 @@ function fmtDate(ts) {
   return d.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" }) +
     " " + d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
 }
+// Full absolute timestamp — for dates where "3d ago" isn't enough, such as a
+// file's modification time on the video page.
+function fmtDateAbs(ts) {
+  if (!ts) return "\u2014";
+  const d = new Date(ts * 1000);
+  return d.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" }) +
+    " " + d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+}
 function resLabel(w, h) {
   if (!h) return null;
   const map = { 2160: "4K", 1440: "1440p", 1080: "1080p", 720: "720p", 480: "480p", 360: "360p", 240: "240p" };
@@ -157,6 +165,7 @@ const ICON = {
   tag: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20.6 13.4 12 22l-9-9V3h10l7.6 7.6a2 2 0 0 1 0 2.8z"/><circle cx="7.5" cy="7.5" r="1.5" fill="currentColor" stroke="none"/></svg>`,
   gridView: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>`,
   listView: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M8 6h13M8 12h13M8 18h13"/><path d="M3.5 6h.01M3.5 12h.01M3.5 18h.01"/></svg>`,
+  filter: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h18l-7 8v6l-4 2v-8z"/></svg>`,
   download: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>`,
 };
 
@@ -1496,6 +1505,120 @@ function mountVRViewer(host, video, v, id) {
   };
 }
 
+// ── Playback failures ──
+// Containers no browser plays in a plain <video> element, keyed by ffprobe's
+// format_name (first entry) with the file extension as a fallback.
+const UNPLAYABLE_CONTAINERS = {
+  mpegts: "MPEG-TS", avi: "AVI", flv: "FLV", asf: "WMV/ASF", mpeg: "MPEG-PS",
+};
+const UNPLAYABLE_EXTS = {
+  ".ts": "mpegts", ".m2ts": "mpegts", ".mts": "mpegts", ".avi": "avi",
+  ".flv": "flv", ".wmv": "asf", ".mpg": "mpeg", ".mpeg": "mpeg",
+};
+// Codecs that can be copied into MP4 untouched and still play in browsers.
+const MP4_SAFE_VCODECS = ["h264", "av1", "vp9"];
+const MP4_SAFE_ACODECS = ["aac", "mp3", "opus", "flac"];
+
+function unplayableContainer(v) {
+  let c = (v.container || "").toLowerCase();
+  if (!UNPLAYABLE_CONTAINERS[c]) {
+    const name = v.rel_path || v.filename || "";
+    const dot = name.lastIndexOf(".");
+    c = dot >= 0 ? UNPLAYABLE_EXTS[name.slice(dot).toLowerCase()] || "" : "";
+  }
+  return UNPLAYABLE_CONTAINERS[c] || null;
+}
+
+// The cheapest ffmpeg command that turns the file into a browser-playable MP4:
+// streams that are already fine are copied (lossless, takes seconds), the rest
+// are re-encoded to H.264/AAC.
+function ffmpegFixCommand(v) {
+  const input = v.rel_path || v.filename || "input";
+  const dot = input.lastIndexOf(".");
+  const stem = dot > 0 ? input.slice(0, dot) : input;
+  const output = input.toLowerCase().endsWith(".mp4") ? `${stem}-fixed.mp4` : `${stem}.mp4`;
+  const vc = (v.vcodec || "").toLowerCase();
+  const ac = (v.acodec || "").toLowerCase();
+  const args = ["ffmpeg", "-i", `"${input}"`];
+  if (vc) args.push(...(MP4_SAFE_VCODECS.includes(vc)
+    ? ["-c:v", "copy"] : ["-c:v", "libx264", "-crf", "20", "-preset", "medium"]));
+  if (ac) args.push(...(MP4_SAFE_ACODECS.includes(ac)
+    ? ["-c:a", "copy"] : ["-c:a", "aac", "-b:a", "192k"]));
+  args.push("-movflags", "+faststart", `"${output}"`);
+  const copiesAll = (!vc || MP4_SAFE_VCODECS.includes(vc)) && (!ac || MP4_SAFE_ACODECS.includes(ac));
+  return { cmd: args.join(" "), lossless: copiesAll };
+}
+
+// One-line reason, used for the channel-mode toast.
+function playbackErrorSummary(v, code) {
+  const box = unplayableContainer(v);
+  if (code === MediaError.MEDIA_ERR_NETWORK) return "the file couldn't be loaded";
+  if (code === MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED && box) return `${box} isn't playable in browsers`;
+  const codec = (v.vcodec || "unknown codec").toUpperCase();
+  if (code === MediaError.MEDIA_ERR_DECODE) return `decoding ${codec} failed`;
+  return `the browser can't play ${codec}`;
+}
+
+// Explanation box shown under the player on the video page.
+function playbackErrorNote(v, code, fileMissing) {
+  if (fileMissing) {
+    return el("div", { class: "codec-warning" }, [
+      el("strong", {}, "Can't play: the file is missing"),
+      el("p", {}, "The server couldn't open this file. It may have been moved, renamed or " +
+        "deleted since the last scan. Rescan the library to update the index."),
+    ]);
+  }
+  if (code === MediaError.MEDIA_ERR_NETWORK) {
+    return el("div", { class: "codec-warning" }, [
+      el("strong", {}, "Can't play: the file couldn't be loaded"),
+      el("p", {}, "The download was interrupted. Check that the server is reachable and " +
+        "that the media folder is still mounted, then reload the page."),
+    ]);
+  }
+  const box = unplayableContainer(v);
+  const codec = (v.vcodec || "").toUpperCase();
+  const fix = ffmpegFixCommand(v);
+  let title, body;
+  if (code === MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED && box) {
+    title = `Can't play: browsers don't support ${box} files`;
+    body = `This file uses the ${box} container${codec ? ` with ${codec} video` : ""}. No browser plays ` +
+      `${box} in a regular video player, whatever codecs are inside. The file isn't ` +
+      "damaged; it plays in VLC or mpv.";
+  } else if (code === MediaError.MEDIA_ERR_DECODE) {
+    title = `Playback failed: the browser couldn't decode ${codec || "this video"}`;
+    body = "The browser started the file but its decoder failed. This often comes from " +
+      "hardware video decoding (GPU driver or browser flags) rather than the file. Try " +
+      "another browser, or turn off hardware video decoding, before converting.";
+  } else {
+    title = `Can't play: your browser doesn't support ${codec || "this file's format"}`;
+    body = `The browser rejected this file${codec ? ` (${codec} video` +
+      (v.acodec ? `, ${v.acodec.toUpperCase()} audio)` : ")") : ""}. It may play in a ` +
+      "different browser, or in VLC or mpv.";
+  }
+  // Already MP4/WebM/MKV with browser-friendly codecs: remuxing changes
+  // nothing, so the browser build itself lacks the codec (e.g. a Chromium
+  // without proprietary codecs, which can't play H.264 or AAC).
+  if (!box && fix.lossless) {
+    return el("div", { class: "codec-warning" }, [
+      el("strong", {}, title),
+      el("p", {}, body),
+      el("p", {}, "These codecs normally play in every browser, so converting the file " +
+        "won't help. This browser build is likely missing the codec, or its hardware " +
+        "decoding is failing."),
+    ]);
+  }
+  return el("div", { class: "codec-warning" }, [
+    el("strong", {}, title),
+    el("p", {}, body),
+    el("p", {}, fix.lossless
+      ? "The streams inside are browser-friendly, so copying them into an MP4 fixes it " +
+        "without re-encoding (lossless, takes seconds):"
+      : "Converting to MP4 makes it play everywhere. Streams that are already " +
+        "browser-friendly are copied as-is; the rest are re-encoded:"),
+    el("code", { class: "codec-cmd" }, fix.cmd),
+  ]);
+}
+
 async function renderVideo(id) {
   state.view = "video";
   const c = main();
@@ -1547,6 +1670,24 @@ async function renderVideo(id) {
   };
   video.addEventListener("loadeddata", checkVideoTrack);
   video.addEventListener("playing", checkVideoTrack);
+
+  // When the browser rejects the file outright (an AVI or MPEG-TS container, an
+  // unsupported codec, a decoder crash) it fires "error" and leaves the player
+  // blank. Explain why instead. A missing file also surfaces as "not
+  // supported", because the 404 body isn't media, so check the stream first.
+  video.addEventListener("error", async () => {
+    const err = video.error;
+    if (codecWarned || !err || err.code === MediaError.MEDIA_ERR_ABORTED) return;
+    codecWarned = true;
+    let fileMissing = false;
+    try {
+      const r = await fetch(`/api/stream/${id}`, { headers: { Range: "bytes=0-0" } });
+      fileMissing = r.status === 404 || r.status === 403;
+      if (r.body) r.body.cancel().catch(() => {});
+    } catch (e) { /* network failure: let the media error code speak */ }
+    const note = playbackErrorNote(v, err.code, fileMissing);
+    video.parentNode && video.parentNode.insertBefore(note, video.nextSibling);
+  });
 
   // Record a play the first time playback actually starts — not merely when the
   // info page is opened — so browsing to a video doesn't mark it watched.
@@ -1745,6 +1886,8 @@ async function renderVideo(id) {
     ["Bitrate", v.bitrate ? `${(v.bitrate / 1e6).toFixed(2)} Mbps` : "—"],
     ["Container", v.container || "—"],
     ["File size", fmtBytes(v.size)],
+    ["File date", fmtDateAbs(v.mtime)],
+    ["Date added", fmtDateAbs(v.added_at)],
     ["Last played", fmtDate(v.last_played)],
     ["Play count", String(v.play_count)],
     ["Status", v.watched ? "Watched" : (v.position > 0 ? `In progress (${fmtDuration(v.position)})` : "Not watched")],
@@ -2086,6 +2229,7 @@ const SETTINGS_CATS = [
   ["media", "Media Management", `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="m10 9 5 3-5 3z" fill="currentColor" stroke="none"/></svg>`],
   ["tags", "Tag Management", `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20.6 13.4 12 22l-9-9V3h10l7.6 7.6a2 2 0 0 1 0 2.8z"/><circle cx="7.5" cy="7.5" r="1.5" fill="currentColor" stroke="none"/></svg>`],
   ["ai", "AI Analysis", `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M12 3l1.9 4.6 4.6 1.9-4.6 1.9L12 16l-1.9-4.6L5.5 9.5l4.6-1.9z"/><path d="M19 14.5l.7 1.8 1.8.7-1.8.7-.7 1.8-.7-1.8-1.8-.7 1.8-.7z"/></svg>`],
+  ["stats", "Statistics", `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg>`],
   ["about", "About", `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 11v5" stroke-linecap="round"/><circle cx="12" cy="7.8" r="1" fill="currentColor" stroke="none"/></svg>`],
 ];
 let settingsCat = "general";
@@ -2148,6 +2292,7 @@ async function renderSettings() {
   else if (settingsCat === "tags") await settingsTags(body);
   else if (settingsCat === "about") await settingsAbout(body);
   else if (settingsCat === "ai") await settingsAI(body);
+  else if (settingsCat === "stats") await settingsStats(body);
 
   c.appendChild(el("div", { class: "settings-wrap" }, [cats, body]));
 }
@@ -2302,6 +2447,76 @@ function settingsMedia(body) {
     "Find videos with identical contents, the same file size, or the same length — and clean them up.",
     el("button", { class: "btn", onClick: () => navigate("duplicates") },
       [el("span", { html: ICON.film }), "Find duplicates"])));
+
+  // CSV media report for the whole library or one folder.
+  const reportMode = el("select", { class: "theme", title: "Report detail" }, [
+    el("option", { value: "quick" }, "Quick (from index)"),
+    el("option", { value: "detailed" }, "Detailed (re-probe files)"),
+  ]);
+  const reportBtn = el("button", {
+    class: "btn",
+    onClick: () => {
+      const p = mediaScopeParams();
+      if (reportMode.value === "detailed") p.set("detailed", "true");
+      downloadUrl(`/api/report.csv?${p.toString()}`);
+      toast(reportMode.value === "detailed"
+        ? "Detailed report started. Every file is re-probed, so large folders take a while."
+        : "Report downloading");
+    },
+  }, [el("span", { html: ICON.download }), "Download CSV"]);
+  body.appendChild(settingRow("Media report",
+    "CSV with resolution, duration, frame rate, codecs, bitrate, container, size, " +
+    "extension mismatches, browser playability and tags, for the whole library or one " +
+    "folder. Detailed mode re-probes each file for track counts, languages, embedded " +
+    "title/artist/encoder tags and chapters; it takes longer on big folders.",
+    el("div", { class: "report-controls" }, [...mediaScopeControls(), reportMode, reportBtn])));
+  body.lastChild.classList.add("stacked");
+
+  // Browser-incompatible files; the count is fetched live for the hint.
+  const compatHint = el("span", {}, "Checking…");
+  body.appendChild(settingRow("Browser-incompatible files",
+    el("span", {}, ["Files in containers or codecs browsers can't play (AVI, MPEG-TS, " +
+      "WMV, MPEG-4 Part 2, AC-3 audio…), plus HEVC and wrong extensions. ", compatHint]),
+    el("button", { class: "btn", onClick: () => navigate("incompatible") },
+      [el("span", { html: ICON.film }), "Review files"])));
+  api.get("/api/incompatible").then((r) => {
+    compatHint.textContent = r.items.length
+      ? `${r.unplayable} won't play and ${r.limited} may not play, out of ${r.scanned}.`
+      : `All ${r.scanned} files should play in a browser.`;
+  }).catch(() => { compatHint.textContent = ""; });
+
+  // Orphaned posters: every scan sweeps them, so this button mostly matters
+  // between scans. The count is fetched live so the hint says what it will do.
+  const thumbHint = el("span", {}, "Checking…");
+  const thumbBtn = el("button", { class: "btn" },
+    [el("span", { html: ICON.trash }), el("span", {}, "Clean up thumbnails")]);
+  const thumbLabel = thumbBtn.lastChild;
+  const refreshThumbs = async () => {
+    let r;
+    try { r = await api.get("/api/thumbnails/orphans"); }
+    catch (e) { thumbHint.textContent = "Could not check the thumbnail cache."; return; }
+    thumbHint.textContent = r.orphans
+      ? `${r.orphans} of ${r.total} cached thumbnail${r.total === 1 ? "" : "s"} no longer belong to any video (${fmtBytes(r.bytes)}).`
+      : `All ${r.total} cached thumbnail${r.total === 1 ? "" : "s"} belong to videos in the library.`;
+    thumbBtn.disabled = !r.orphans;
+  };
+  thumbBtn.addEventListener("click", async () => {
+    thumbBtn.disabled = true;
+    thumbLabel.textContent = "Cleaning…";
+    try {
+      const r = await api.post("/api/thumbnails/cleanup");
+      toast(r.removed
+        ? `Removed ${r.removed} stale thumbnail${r.removed === 1 ? "" : "s"} (${fmtBytes(r.bytes)})`
+        : "No stale thumbnails to remove");
+    } catch (e) { toast(e.message || "Could not clean up thumbnails"); }
+    finally { thumbLabel.textContent = "Clean up thumbnails"; refreshThumbs(); }
+  });
+  body.appendChild(settingRow("Thumbnail cache",
+    el("span", {}, [
+      el("span", {}, "Thumbnails of deleted or removed videos are cleaned up automatically at the end of every scan. Run it now to reclaim the space sooner. "),
+      thumbHint,
+    ]), thumbBtn));
+  refreshThumbs();
 
   body.appendChild(settingRow("Reset watched status",
     "Remove the Watched flag (the badge on cards) from every video. The Watched page is driven by play history, which this keeps.",
@@ -2648,6 +2863,255 @@ async function settingsAbout(body) {
   }
 }
 
+/* ------------------------------------------------------- settings: stats */
+// "2d 4h 12m" style runtime for library totals, where hh:mm:ss stops being
+// readable. Drops to minutes/seconds for short spans.
+function fmtDurationLong(sec) {
+  if (!sec) return "0m";
+  sec = Math.round(sec);
+  const d = Math.floor(sec / 86400), h = Math.floor((sec % 86400) / 3600);
+  const m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  if (d) return `${d}d ${h}h ${m}m`;
+  if (h) return `${h}h ${m}m`;
+  if (m) return `${m}m ${s}s`;
+  return `${s}s`;
+}
+function pct(part, whole) { return whole ? Math.round((part / whole) * 1000) / 10 : 0; }
+function fmtCount(n) { return Number(n || 0).toLocaleString(); }
+
+// Slice colours cycle through the theme palette so every theme stays legible.
+const CHART_COLORS = [
+  "var(--accent)", "var(--accent-2)", "var(--success)", "var(--warning)",
+  "var(--danger)", "color-mix(in srgb, var(--accent) 55%, var(--text))",
+  "color-mix(in srgb, var(--accent-2) 55%, var(--success))",
+  "var(--text-dim)", "var(--text-faint)",
+];
+
+function statCard(value, label, sub) {
+  return el("div", { class: "stat-card" }, [
+    el("div", { class: "stat-value" }, value),
+    el("div", { class: "stat-label" }, label),
+    sub ? el("div", { class: "stat-sub" }, sub) : null,
+  ]);
+}
+
+function statsSection(title, desc, ...children) {
+  return el("div", { class: "stats-section" }, [
+    el("h3", { class: "stats-section-title" }, title),
+    desc ? el("p", { class: "stats-section-desc" }, desc) : null,
+    ...children,
+  ]);
+}
+
+// Donut chart built from stroked circles: each slice is one circle with a
+// dash covering its share of the circumference, rotated to where the previous
+// slice ended. No canvas, scales with the page, themes via CSS variables.
+function donutChart(slices, total, centerLabel) {
+  const r = 40, c = 2 * Math.PI * r;
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", "0 0 100 100");
+  svg.setAttribute("class", "donut");
+  let offset = 0;
+  slices.forEach((s, i) => {
+    const share = total ? s.count / total : 0;
+    const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+    circle.setAttribute("cx", "50"); circle.setAttribute("cy", "50"); circle.setAttribute("r", String(r));
+    circle.setAttribute("fill", "none");
+    circle.setAttribute("stroke", CHART_COLORS[i % CHART_COLORS.length]);
+    circle.setAttribute("stroke-width", "16");
+    circle.setAttribute("stroke-dasharray", `${share * c} ${c}`);
+    circle.setAttribute("transform", `rotate(${-90 + offset * 360} 50 50)`);
+    const t = document.createElementNS("http://www.w3.org/2000/svg", "title");
+    t.textContent = `${s.label}: ${fmtCount(s.count)} (${pct(s.count, total)}%)`;
+    circle.appendChild(t);
+    svg.appendChild(circle);
+    offset += share;
+  });
+  const wrap = el("div", { class: "donut-wrap" }, [svg]);
+  if (centerLabel) wrap.appendChild(el("div", { class: "donut-center" }, centerLabel));
+  return wrap;
+}
+
+function chartLegend(slices, total, extra) {
+  return el("ul", { class: "chart-legend" }, slices.map((s, i) => el("li", {}, [
+    el("span", { class: "legend-swatch", style: `background:${CHART_COLORS[i % CHART_COLORS.length]}` }),
+    el("span", { class: "legend-label" }, s.label),
+    el("span", { class: "legend-value" }, `${fmtCount(s.count)} · ${pct(s.count, total)}%`),
+    extra ? el("span", { class: "legend-extra" }, extra(s)) : null,
+  ])));
+}
+
+// Horizontal bars, scaled to the largest entry. `fmt` renders the number.
+function barList(items, { fmt = fmtCount, valueKey = "count", label = (i) => i.name, onClick } = {}) {
+  const max = Math.max(0, ...items.map((i) => i[valueKey] || 0));
+  return el("div", { class: "bar-list" }, items.map((i) => el("div", onClick
+    ? { class: "bar-row clickable", onClick: () => onClick(i) }
+    : { class: "bar-row" }, [
+    el("div", { class: "bar-label", title: label(i) }, label(i)),
+    el("div", { class: "bar-track" }, [el("div", { class: "bar-fill", style: `width:${max ? ((i[valueKey] || 0) / max) * 100 : 0}%` })]),
+    el("div", { class: "bar-value" }, fmt(i[valueKey] || 0)),
+  ])));
+}
+
+// Compact column chart for "plays by weekday/hour" — same scaling as barList.
+function columnChart(values, labels) {
+  const max = Math.max(0, ...values);
+  return el("div", { class: "col-chart" }, values.map((v, i) => el("div", {
+    class: "col", title: `${labels[i]}: ${fmtCount(v)} play${v === 1 ? "" : "s"}`,
+  }, [
+    el("div", { class: "col-fill", style: `height:${max ? (v / max) * 100 : 0}%` }),
+    el("div", { class: "col-label" }, labels[i]),
+  ])));
+}
+
+function videoLink(id, title) {
+  return el("a", { class: "about-link", href: buildHash("video", id) }, title);
+}
+
+async function settingsStats(body) {
+  body.appendChild(el("h2", { class: "settings-section-title" }, "Statistics"));
+  body.appendChild(el("p", { class: "settings-section-desc" },
+    "A picture of your library and how you watch it. Everything here is computed from the database; nothing leaves the machine."));
+
+  let s;
+  try { s = await api.get("/api/stats/library"); }
+  catch (e) { body.appendChild(el("div", { class: "empty" }, "Could not load statistics.")); return; }
+
+  const t = s.totals, rt = s.runtime, st = s.storage, pl = s.plays;
+  if (!t.videos) {
+    body.appendChild(el("div", { class: "empty" }, [
+      el("div", { html: ICON.film }),
+      el("h2", {}, "Nothing to count yet"),
+      el("p", {}, "Statistics appear once the library has been scanned."),
+    ]));
+    return;
+  }
+
+  // ── Headline numbers ──
+  body.appendChild(el("div", { class: "stats-grid" }, [
+    statCard(fmtCount(t.videos), "Videos", `${fmtCount(t.watched)} watched · ${fmtCount(t.unwatched)} unwatched`),
+    statCard(fmtDurationLong(rt.total), "Total runtime", `${fmtDuration(rt.average)} on average`),
+    statCard(fmtBytes(st.bytes), "Library size", `${fmtBytes(st.average)} per video`),
+    statCard(fmtDurationLong(pl.time_watched), "Time spent watching", pl.total
+      ? `${fmtCount(pl.total)} play${pl.total === 1 ? "" : "s"} · ${fmtCount(pl.distinct)} distinct video${pl.distinct === 1 ? "" : "s"}`
+      : "No plays recorded yet"),
+  ]));
+
+  // ── Watch progress ──
+  const done = pct(t.watched, t.videos), partial = pct(t.in_progress, t.videos);
+  body.appendChild(statsSection("Watch progress", null,
+    el("div", { class: "progress-stack", title: `${done}% watched, ${partial}% in progress` }, [
+      el("div", { class: "seg watched", style: `width:${done}%` }),
+      el("div", { class: "seg partial", style: `width:${partial}%` }),
+    ]),
+    el("div", { class: "progress-legend" }, [
+      el("span", {}, [el("span", { class: "legend-swatch watched" }), `Watched ${fmtCount(t.watched)} (${done}%)`]),
+      el("span", {}, [el("span", { class: "legend-swatch partial" }), `In progress ${fmtCount(t.in_progress)} (${partial}%)`]),
+      el("span", {}, [el("span", { class: "legend-swatch none" }), `Unwatched ${fmtCount(t.unwatched - t.in_progress)}`]),
+    ]),
+    el("p", { class: "stats-note" }, [
+      `You've watched ${fmtDurationLong(rt.watched)} of ${fmtDurationLong(rt.total)}. `,
+      rt.remaining > 0
+        ? `Watching everything that's left would take about ${fmtDurationLong(rt.remaining)}.`
+        : "You've seen it all.",
+    ]),
+  ));
+
+  // ── Quality ──
+  const qTotal = s.quality.reduce((n, q) => n + q.count, 0);
+  body.appendChild(statsSection("Quality", "By resolution, with VR content counted separately.",
+    el("div", { class: "chart-row" }, [
+      donutChart(s.quality, qTotal, el("span", {}, [el("b", {}, fmtCount(qTotal)), " videos"])),
+      chartLegend(s.quality, qTotal, (q) => `${fmtDurationLong(q.duration)} · ${fmtBytes(q.bytes)}`),
+    ])));
+
+  // ── Most played ──
+  if (s.popular.length) {
+    const table = el("table", { class: "stats-table" }, [
+      el("thead", {}, [el("tr", {}, [el("th", {}, "#"), el("th", {}, "Video"), el("th", { class: "num" }, "Plays"), el("th", { class: "num" }, "Last played")])]),
+      el("tbody", {}, s.popular.map((v, i) => el("tr", {}, [
+        el("td", { class: "rank" }, String(i + 1)),
+        el("td", { class: "title" }, videoLink(v.id, v.title)),
+        el("td", { class: "num" }, fmtCount(v.plays)),
+        el("td", { class: "num" }, fmtDate(v.last_played)),
+      ]))),
+    ]);
+    body.appendChild(statsSection("Most played", null, table));
+  }
+
+  // ── Viewing habits ──
+  if (pl.total) {
+    const days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    const dayNames = ["Mondays", "Tuesdays", "Wednesdays", "Thursdays", "Fridays", "Saturdays", "Sundays"];
+    const hours = Array.from({ length: 24 }, (_, h) => (h % 6 === 0 ? String(h).padStart(2, "0") : ""));
+    const busiestDay = dayNames[pl.by_weekday.indexOf(Math.max(...pl.by_weekday))];
+    const busiestHour = pl.by_hour.indexOf(Math.max(...pl.by_hour));
+    body.appendChild(statsSection("When you watch",
+      `${fmtCount(pl.last_7d)} play${pl.last_7d === 1 ? "" : "s"} in the last 7 days, ${fmtCount(pl.last_30d)} in the last 30. ` +
+      `Busiest: ${busiestDay} around ${String(busiestHour).padStart(2, "0")}:00.` +
+      (pl.first ? ` First recorded play ${fmtDate(pl.first)}.` : ""),
+      el("div", { class: "chart-row wrap" }, [
+        el("div", { class: "chart-block" }, [el("div", { class: "chart-caption" }, "By day of week"), columnChart(pl.by_weekday, days)]),
+        el("div", { class: "chart-block grow" }, [el("div", { class: "chart-caption" }, "By hour of day"), columnChart(pl.by_hour, hours)]),
+      ])));
+  }
+
+  // ── Records ──
+  const rec = s.records;
+  const recRows = [
+    ["Longest video", rec.longest, (r) => fmtDuration(r.value)],
+    ["Shortest video", rec.shortest, (r) => fmtDuration(r.value)],
+    ["Largest file", rec.largest, (r) => fmtBytes(r.value)],
+    ["Highest bitrate", rec.highest_bitrate, (r) => `${(r.value / 1e6).toFixed(2)} Mbps`],
+    ["Oldest file", rec.oldest_file, (r) => fmtDateAbs(r.value)],
+    ["Newest file", rec.newest_file, (r) => fmtDateAbs(r.value)],
+    ["Latest addition", rec.newest_added, (r) => fmtDate(r.value)],
+  ].filter(([, r]) => r);
+  if (recRows.length) {
+    const table = el("table", { class: "meta-table" }, recRows.map(([label, r, fmt]) =>
+      el("tr", {}, [el("td", {}, label), el("td", {}, [videoLink(r.id, r.title), el("span", { class: "record-value" }, fmt(r))])])));
+    body.appendChild(statsSection("Records", null, table));
+  }
+
+  // ── Breakdowns ──
+  const blocks = [];
+  if (s.folders.length) blocks.push(el("div", { class: "chart-block grow" }, [
+    el("div", { class: "chart-caption" }, "Top-level folders"),
+    barList(s.folders, { onClick: (f) => navigate("browse", f.name === "(root)" ? "" : f.name) }),
+  ]));
+  if (s.tags.length) blocks.push(el("div", { class: "chart-block grow" }, [
+    el("div", { class: "chart-caption" }, "Most used tags"),
+    barList(s.tags, { onClick: (tg) => navigate("tag", tg.name) }),
+  ]));
+  if (s.codecs.length) blocks.push(el("div", { class: "chart-block grow" }, [
+    el("div", { class: "chart-caption" }, "Video codecs"), barList(s.codecs),
+  ]));
+  if (s.containers.length) blocks.push(el("div", { class: "chart-block grow" }, [
+    el("div", { class: "chart-caption" }, "Containers"), barList(s.containers),
+  ]));
+  if (blocks.length) body.appendChild(statsSection("Breakdowns", null, el("div", { class: "chart-row wrap" }, blocks)));
+
+  // ── Library growth ──
+  if (s.growth.length > 1) {
+    body.appendChild(statsSection("Library growth", "Videos added per month over the last year.",
+      columnChart(s.growth.map((g) => g.count), s.growth.map((g) => {
+        const [y, m] = g.month.split("-");
+        return new Date(Number(y), Number(m) - 1, 1).toLocaleDateString(undefined, { month: "short" });
+      }))));
+  }
+
+  // ── The rest ──
+  body.appendChild(statsSection("More numbers", null, el("div", { class: "stats-grid small" }, [
+    statCard(fmtCount(t.favorites), "Favorites"),
+    statCard(fmtCount(t.vr), "VR videos"),
+    statCard(fmtCount(t.tagged), "Tagged", `${fmtCount(t.untagged)} untagged · ${fmtCount(t.tags)} tag${t.tags === 1 ? "" : "s"}`),
+    statCard(fmtCount(t.ai_summarized), "AI summaries", `${pct(t.ai_summarized, t.videos)}% of the library`),
+    statCard(fmtCount(t.folders), "Folders"),
+    statCard(fmtCount(t.channels), "Saved channels"),
+    statCard(st.avg_bitrate ? `${(st.avg_bitrate / 1e6).toFixed(1)} Mbps` : "—", "Average bitrate"),
+  ])));
+}
+
 /* ------------------------------------------------------------ settings: AI */
 let aiSettingsPollTimer = null;
 
@@ -2704,8 +3168,16 @@ async function settingsAI(body) {
       testOut.className = "ai-test-result";
       try {
         const r = await api.post("/api/ai/test");
-        testOut.textContent = `OK — ${r.model} replied.`;
-        testOut.classList.add("ok");
+        // A failed check is a normal 200 answer carrying the reason. Reading
+        // it off the body is the only way the user sees anything more useful
+        // than the HTTP status text.
+        if (r.ok === false) {
+          testOut.textContent = r.error || "Failed";
+          testOut.classList.add("err");
+        } else {
+          testOut.textContent = `OK — ${r.model} replied.`;
+          testOut.classList.add("ok");
+        }
       } catch (e) {
         testOut.textContent = e.message || "Failed";
         testOut.classList.add("err");
@@ -2715,6 +3187,16 @@ async function settingsAI(body) {
   body.appendChild(settingRow("Connection",
     "Send a tiny text-only request to verify the endpoint, model and key.",
     el("div", { class: "ai-test-wrap" }, [testBtn, testOut])));
+
+  const thinkToggle = toggleSwitch(s.ai_disable_thinking === "1", async (on) => {
+    await saveSetting("ai_disable_thinking", on ? "1" : "0");
+  });
+  body.appendChild(settingRow("Skip reasoning tokens",
+    "Reasoning models (Qwen3 and friends) spend their token budget thinking " +
+    "before they answer, which is slow and can return nothing at all. This " +
+    "asks the server to turn thinking off. vLLM and most local servers accept " +
+    "it; the OpenAI API does not, so leave it off there.",
+    thinkToggle));
 
   // ── Frame sampling ──
   body.appendChild(el("h2", { class: "settings-section-title", style: "margin-top:40px" }, "Frame sampling"));
@@ -2845,9 +3327,231 @@ async function settingsAI(body) {
   pollBatch(); // pick up an already-running job when opening the page
 }
 
+/* ------------------------------------------------- media reports & compat */
+// Folder scope shared by the CSV report and the compatibility page, so
+// picking a folder in one carries over to the other.
+const mediaScope = { folder: "", recursive: true };
+
+function mediaScopeParams() {
+  const p = new URLSearchParams();
+  // "Whole library" always means everything; the subfolder box (hidden then)
+  // only narrows a chosen folder.
+  if (mediaScope.folder) {
+    p.set("folder", mediaScope.folder);
+    if (!mediaScope.recursive) p.set("recursive", "false");
+  }
+  return p;
+}
+
+// Folder picker + "include subfolders" checkbox, bound to mediaScope.
+function mediaScopeControls(onChange) {
+  const folders = state.tree || [];
+  const sel = el("select", { class: "theme report-folder", title: "Folder" }, [
+    el("option", { value: "" }, "Whole library"),
+    ...folders.map((f) => {
+      const depth = f.path.split("/").length - 1;
+      const name = f.path.slice(f.path.lastIndexOf("/") + 1);
+      return el("option", { value: f.path, title: f.path },
+        "\u00a0\u00a0".repeat(depth) + name);
+    }),
+  ]);
+  sel.value = folders.some((f) => f.path === mediaScope.folder) ? mediaScope.folder : "";
+  mediaScope.folder = sel.value;
+  const box = el("input", { type: "checkbox" });
+  box.checked = mediaScope.recursive;
+  const sub = el("label", { class: "report-sub", title: "Include files in subfolders" },
+    [box, "Subfolders"]);
+  const sync = () => { sub.style.display = sel.value ? "" : "none"; };
+  sel.addEventListener("change", () => { mediaScope.folder = sel.value; sync(); onChange && onChange(); });
+  box.addEventListener("change", () => { mediaScope.recursive = box.checked; onChange && onChange(); });
+  sync();
+  return [sel, sub];
+}
+
+function downloadUrl(href) {
+  const a = el("a", { href, download: "" });
+  a.style.display = "none";
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => a.remove(), 2000);
+}
+
+// navigator.clipboard only exists on HTTPS or localhost, and LocalChannels is
+// often reached over plain HTTP on the LAN, so fall back to execCommand.
+async function copyText(text) {
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch (e) { /* fall through */ }
+  const ta = el("textarea", { style: "position:fixed;opacity:0;top:0;left:0" });
+  ta.value = text;
+  document.body.appendChild(ta);
+  ta.select();
+  let ok = false;
+  try { ok = document.execCommand("copy"); } catch (e) {}
+  ta.remove();
+  return ok;
+}
+
+let compatKind = "";        // "" = every issue kind
+const COMPAT_PAGE = 200;
+
+async function renderIncompatible() {
+  state.view = "incompatible";
+  document.querySelectorAll(".nav-item").forEach((n) => n.classList.remove("active"));
+  highlightTree();
+  const c = main();
+  c.innerHTML = "";
+  c.appendChild(el("div", { class: "crumbs" }, [
+    el("a", { onClick: () => navigate("settings") }, "Settings"),
+    el("span", { class: "sep" }, "/"),
+    el("span", {}, "Incompatible files"),
+  ]));
+  c.appendChild(el("div", { class: "page-head" },
+    [el("h1", { class: "page-title" }, "Browser-incompatible files")]));
+
+  const toolbar = el("div", { class: "dupe-toolbar" }, [
+    el("span", { class: "sb-label" }, "Folder"),
+    ...mediaScopeControls(() => renderIncompatible()),
+  ]);
+  c.appendChild(toolbar);
+
+  const holder = el("div", {}, [el("div", { class: "empty" },
+    [el("div", { class: "spinner", style: "margin:0 auto" })])]);
+  c.appendChild(holder);
+
+  let data;
+  try { data = await api.get(`/api/incompatible?${mediaScopeParams().toString()}`); }
+  catch (e) { holder.innerHTML = ""; holder.appendChild(el("div", { class: "empty" }, [el("h2", {}, "Check failed")])); return; }
+  holder.innerHTML = "";
+  if (data.counts[compatKind] === 0 || (compatKind && !(compatKind in data.counts))) compatKind = "";
+
+  const items = compatKind
+    ? data.items.filter((it) => it.issues.some((i) => i.kind === compatKind))
+    : data.items;
+
+  // Exports follow the folder and the issue filter on screen.
+  const exportParams = () => {
+    const p = mediaScopeParams();
+    if (compatKind) p.set("kinds", compatKind);
+    return p;
+  };
+  toolbar.append(
+    el("span", { class: "spacer", style: "flex:1" }),
+    el("button", {
+      class: "btn", ...(data.items.length ? {} : { disabled: "" }),
+      title: "Full media report for the files listed here",
+      onClick: () => {
+        const p = mediaScopeParams(); p.set("only_issues", "true");
+        downloadUrl(`/api/report.csv?${p.toString()}`);
+      },
+    }, [el("span", { html: ICON.download }), "CSV"]),
+    el("button", {
+      class: "btn", ...(items.length ? {} : { disabled: "" }),
+      title: "Bash script that converts or renames every file in this list",
+      onClick: () => downloadUrl(`/api/incompatible/fix.sh?${exportParams().toString()}`),
+    }, [el("span", { html: ICON.download }), "Fix script"]),
+  );
+
+  holder.appendChild(el("p", { style: "color:var(--text-dim);margin:-4px 0 14px" },
+    data.items.length
+      ? `${data.scanned} files checked in ${data.scope}: ${data.unplayable} won't play in ` +
+        `a browser, ${data.limited} may not play in every browser.` +
+        (data.converted ? ` ${data.converted} already have a converted copy in the library.` : "")
+      : `${data.scanned} files checked in ${data.scope}.`));
+
+  if (!data.items.length) {
+    holder.appendChild(el("div", { class: "empty" }, [
+      el("div", { html: ICON.check }),
+      el("h2", {}, "Everything should play"),
+      el("p", {}, "Every file here uses a container and codecs browsers support."),
+    ]));
+    return;
+  }
+
+  const chips = el("div", { class: "chips", style: "margin-bottom:16px" });
+  const chip = (kind, label, n) => chips.appendChild(el("button", {
+    class: "chip" + (compatKind === kind ? " inc" : ""),
+    onClick: () => { compatKind = kind; renderIncompatible(); },
+  }, [label, el("span", { class: "chip-count" }, String(n))]));
+  chip("", "All", data.items.length);
+  Object.entries(data.labels).forEach(([k, label]) => {
+    if (data.counts[k]) chip(k, label, data.counts[k]);
+  });
+  holder.appendChild(chips);
+  holder.appendChild(el("p", { class: "filter-hint", style: "margin:-6px 0 16px" },
+    "Fix commands run from your library root and never overwrite anything. Streams " +
+    "browsers already play are copied without re-encoding; files with only a wrong " +
+    "extension are renamed. Originals are kept, so delete them yourself after checking."));
+
+  const list = el("div", { class: "dupe-group" });
+  holder.appendChild(list);
+  let shown = 0;
+  const more = el("button", { class: "btn", style: "margin:4px 0 24px" });
+  const drawMore = () => {
+    items.slice(shown, shown + COMPAT_PAGE).forEach((it) => list.appendChild(compatRow(it)));
+    shown = Math.min(items.length, shown + COMPAT_PAGE);
+    more.textContent = `Show more (${items.length - shown} left)`;
+    more.style.display = shown < items.length ? "" : "none";
+  };
+  more.addEventListener("click", drawMore);
+  holder.appendChild(more);
+  drawMore();
+}
+
+function compatRow(it) {
+  const thumb = it.has_thumb
+    ? el("img", { src: `/api/thumb/${it.id}`, loading: "lazy", alt: "" })
+    : el("div", { class: "ph" });
+  const meta = [
+    it.container || "?", it.vcodec || "no video", it.acodec || "no audio",
+    it.duration != null ? fmtDuration(it.duration) : null,
+    it.size ? fmtBytes(it.size) : null,
+  ].filter(Boolean).join(" \u00b7 ");
+  const info = el("div", { class: "di-info" }, [
+    el("div", { class: "card-title", title: it.filename }, it.filename),
+    el("div", { class: "di-path" }, it.rel_path),
+    el("div", { class: "di-meta" }, meta),
+    el("div", { class: "compat-badges" }, it.issues.map((i) =>
+      el("span", { class: `compat-badge ${i.severity}`, title: i.detail }, i.label))),
+    it.fix ? el("code", { class: "codec-cmd compat-cmd" }, it.fix.cmd) : null,
+    it.converted ? el("div", { class: "compat-converted" }, [
+      el("span", { html: ICON.check }),
+      el("span", {}, ["Converted copy in the library: ", el("code", {}, it.converted),
+        ". Check it plays, then delete this original."]),
+    ]) : null,
+  ]);
+  return el("div", { class: "dupe-item compat-item" }, [
+    thumb, info,
+    el("div", { class: "compat-actions" }, [
+      el("button", { class: "btn", onClick: () => navigate("video", it.id) }, "Open"),
+      it.converted ? el("button", {
+        class: "btn ghost", style: "color:var(--danger)",
+        onClick: async () => {
+          if (!confirm(`Delete the original from disk?\n\n${it.rel_path}\n\n` +
+            `The converted copy stays:\n${it.converted}\n\nThis cannot be undone.`)) return;
+          try { await api.del(`/api/video/${it.id}/file`); }
+          catch (e) { toast("Could not delete file"); return; }
+          toast("Original deleted"); loadTree(); renderIncompatible();
+        },
+      }, [el("span", { html: ICON.trash }), "Delete original"]) : null,
+      it.fix ? el("button", {
+        class: "btn",
+        title: it.fix.kind === "rename" ? "Copy the rename command"
+          : it.fix.kind === "remux" ? "Copy the ffmpeg command (lossless copy into MP4)"
+          : "Copy the ffmpeg command (re-encodes to H.264/AAC)",
+        onClick: async () => toast(await copyText(it.fix.cmd) ? "Command copied" : "Could not copy"),
+      }, "Copy command") : null,
+    ]),
+  ]);
+}
+
 /* ------------------------------------------------------------ duplicates */
 let dupeMethod = "hash";
 let dupeTolerance = 0;   // milliseconds of slack when matching by length
+let dupeShowIgnored = false;
 const DUPE_METHODS = [["hash", "Identical files"], ["size", "Same file size"], ["duration", "Same length"]];
 const DUPE_TOLERANCES = [
   [0, "Exact (to the ms)"], [10, "±10 ms"], [100, "±100 ms"],
@@ -2890,6 +3594,8 @@ async function renderDuplicates() {
       : dupeMethod === "size" ? "Videos sharing an exact file size."
       : dupeTolerance === 0 ? "Runtimes that match to the millisecond."
       : `Runtimes within ${dupeTolerance >= 1000 ? `${dupeTolerance / 1000} s` : `${dupeTolerance} ms`} of each other.`));
+  const ignoredSlot = el("span", { class: "spacer" });
+  toolbar.appendChild(ignoredSlot);
   c.appendChild(toolbar);
 
   const holder = el("div", {});
@@ -2904,28 +3610,75 @@ async function renderDuplicates() {
   catch (e) { holder.innerHTML = ""; holder.appendChild(el("div", { class: "empty" }, [el("h2", {}, "Scan failed")])); return; }
 
   holder.innerHTML = "";
-  if (!data.groups.length) {
+
+  // Dismissed groups come back from the server flagged rather than missing, so
+  // the toggle costs nothing extra.
+  if (data.ignored) {
+    ignoredSlot.className = "";
+    ignoredSlot.appendChild(el("button", {
+      class: "btn ghost" + (dupeShowIgnored ? " on" : ""),
+      title: dupeShowIgnored
+        ? "Hide the groups you've dismissed"
+        : "Show the groups you've dismissed",
+      onClick: () => { dupeShowIgnored = !dupeShowIgnored; renderDuplicates(); },
+    }, dupeShowIgnored
+      ? `Hide ignored (${data.ignored})`
+      : `Show ignored (${data.ignored})`));
+  }
+
+  const shown = data.groups.filter((g) => dupeShowIgnored || !g.ignored);
+  if (!shown.length) {
     holder.appendChild(el("div", { class: "empty" }, [
       el("div", { html: ICON.check }),
-      el("h2", {}, "No duplicates found"),
-      el("p", {}, "Nothing matched by this method."),
+      el("h2", {}, data.ignored ? "Nothing left to review" : "No duplicates found"),
+      el("p", {}, data.ignored
+        ? `Every match by this method is in a group you've already dismissed.`
+        : "Nothing matched by this method."),
     ]));
     return;
   }
-  const total = data.groups.reduce((n, g) => n + g.videos.length, 0);
+  const total = shown.reduce((n, g) => n + g.videos.length, 0);
   holder.appendChild(el("p", { style: "color:var(--text-dim);margin:-4px 0 18px" },
-    `${data.groups.length} group${data.groups.length === 1 ? "" : "s"} · ${total} videos`));
+    `${shown.length} group${shown.length === 1 ? "" : "s"} · ${total} videos`));
 
-  data.groups.forEach((g) => {
+  shown.forEach((g) => {
     const spread = (g.duration_max != null && g.duration_min != null)
       ? Math.round((g.duration_max - g.duration_min) * 1000) : 0;
+    // Ignoring is a judgement about this exact set of files: same runtime,
+    // different soundtrack, both worth keeping. If another copy turns up later
+    // the set no longer matches and the group comes back for review, which is
+    // why the button names the count.
+    const ignoreBtn = g.ignored
+      ? el("button", {
+          class: "btn ghost", title: "Bring this group back into the list",
+          onClick: async () => {
+            try { await api.del(`/api/duplicates/ignore/${g.ignore_id}`); }
+            catch (e) { toast("Could not restore that group"); return; }
+            toast("Group restored"); renderDuplicates();
+          },
+        }, "Stop ignoring")
+      : el("button", {
+          class: "btn ghost",
+          title: `Dismiss these ${g.videos.length} files. They'll come back if another copy shows up.`,
+          onClick: async () => {
+            try {
+              await api.post("/api/duplicates/ignore",
+                { video_ids: g.video_ids, method: data.method });
+            } catch (e) { toast(e.message || "Could not ignore that group"); return; }
+            toast("Group ignored"); renderDuplicates();
+          },
+        }, "Ignore group");
+
     const head = el("div", { class: "dupe-group-head" }, [
       el("span", {}, `${g.videos.length} copies`),
       g.size ? el("span", {}, `· ${fmtBytes(g.size)}`) : null,
       g.duration != null ? el("span", {}, `· ${fmtDurationMs(g.duration)}`) : null,
       spread > 0 ? el("span", { class: "dg-spread" }, `· spread ${spread} ms`) : null,
+      g.ignored ? el("span", { class: "dg-ignored" }, "ignored") : null,
+      el("span", { class: "spacer" }),
+      ignoreBtn,
     ]);
-    const group = el("div", { class: "dupe-group" }, [head]);
+    const group = el("div", { class: "dupe-group" + (g.ignored ? " ignored" : "") }, [head]);
     g.videos.forEach((v) => {
       const thumb = v.has_thumb
         ? el("img", { src: `/api/thumb/${v.id}`, loading: "lazy", alt: "" })
@@ -2974,6 +3727,21 @@ async function renderTags() {
   c.appendChild(el("div", { class: "page-head" }, [el("h1", { class: "page-title" }, "Tags")]));
   const data = await api.get("/api/tags");
 
+  // The filter is the main thing you come to this page to do once you have
+  // more than a handful of tags, so it sits above the tag list.
+  if (data.tags.length) {
+    c.appendChild(el("div", {
+      class: "untagged-card", onClick: () => navigate("tagfilter", tagFilterToHash()),
+    }, [
+      el("span", { class: "uc-icon", html: ICON.filter }),
+      el("div", {}, [
+        el("div", { class: "uc-title" }, "Filter by tags"),
+        el("div", { class: "uc-sub" },
+          "Combine tags to include and exclude, then browse or play the result as a channel"),
+      ]),
+    ]));
+  }
+
   // Always offer the untagged list — it's most useful precisely when there are
   // few or no tags yet and you're working through the library.
   if (data.untagged) {
@@ -2994,7 +3762,8 @@ async function renderTags() {
     ]));
     return;
   }
-  c.appendChild(el("p", { style: "color:var(--text-dim);margin-top:14px" }, "Click a tag to see the videos tagged with it."));
+  c.appendChild(el("p", { style: "color:var(--text-dim);margin-top:18px" },
+    "Click a tag to see the videos tagged with it, or use the filter above to combine several."));
   const wrap = el("div", { class: "tag-pick", style: "max-width:900px" });
   data.tags.forEach((t) => {
     wrap.appendChild(el("div", {
@@ -3003,6 +3772,127 @@ async function renderTags() {
     }, `${t.name}  ·  ${t.count}`));
   });
   c.appendChild(wrap);
+}
+
+/* ------------------------------------------------------ Tags > Filter page
+   A filter built out of the tag list itself: click a tag once to require it,
+   again to exclude it. Include tags are combined with Match any or Match all;
+   an excluded tag always wins, so "any of tag1, tag3 but not tag5" is two
+   clicks apart from "all of tag1, tag3 but not tag5".
+
+   Its own state, separate from the topbar search, so poking at the search box
+   doesn't wipe out a filter you were building — and it lives in the URL, so
+   the result set can be bookmarked and comes back on Back. */
+const tagFilter = { include: [], exclude: [], mode: "all", q: "", page: 0 };
+
+function tagFilterToHash() {
+  const qs = filterToQuery(tagFilter);
+  if (!tagFilter.page) return qs;
+  return (qs ? qs + "&" : "") + "page=" + (tagFilter.page + 1);
+}
+
+async function renderTagFilter(arg) {
+  state.view = "tagfilter";
+  setActiveNav("tags");
+  filterFromQuery(tagFilter, arg, "all");
+  tagFilter.page = Math.max(0, (parseInt(new URLSearchParams(arg || "").get("page"), 10) || 1) - 1);
+
+  const c = main();
+  c.innerHTML = `<div class="empty"><div class="spinner" style="margin:0 auto"></div></div>`;
+
+  const params = new URLSearchParams(filterToQuery(tagFilter));
+  params.set("sort", state.sort.field);
+  params.set("order", state.sort.order);
+  params.set("limit", String(PAGE_SIZE));
+  params.set("offset", String(tagFilter.page * PAGE_SIZE));
+  params.set("facets", "1");
+
+  let data, tagData;
+  try {
+    [data, tagData] = await Promise.all([
+      api.get(`/api/search?${params.toString()}`),
+      api.get("/api/tags"),
+    ]);
+  } catch (e) {
+    c.innerHTML = "";
+    c.appendChild(el("div", { class: "empty" }, [el("h2", {}, "Filter failed")]));
+    return;
+  }
+
+  const rerun = () => { tagFilter.page = 0; navigate("tagfilter", tagFilterToHash()); };
+  const repage = (pg) => { tagFilter.page = pg; navigate("tagfilter", tagFilterToHash()); };
+
+  c.innerHTML = "";
+  c.appendChild(el("div", { class: "crumbs" }, [
+    el("a", { onClick: () => navigate("tags") }, "Tags"),
+    el("span", { class: "sep" }, "/"),
+    el("span", {}, "Filter"),
+  ]));
+  c.appendChild(el("div", { class: "page-head" }, [
+    el("h1", { class: "page-title" }, "Filter by tags"),
+  ]));
+
+  // Turning the filter into a channel is the natural next step, so both routes
+  // out of here sit with the filter rather than at the bottom of the results.
+  const canPlay = !!(tagFilter.include.length || tagFilter.exclude.length) && data.total > 0;
+  const actions = el("div", { class: "filter-actions" }, [
+    el("button", {
+      class: "btn" + (canPlay ? " primary" : ""),
+      ...(canPlay ? {} : { disabled: "" }),
+      title: canPlay ? "Play these videos as a channel now"
+        : "Pick at least one tag first",
+      onClick: () => startChannel("", tagFilter.include, tagFilter.exclude, tagFilter.mode),
+    }, [el("span", { html: ICON.play }), "Play as channel"]),
+    el("button", {
+      class: "btn",
+      ...(canPlay ? {} : { disabled: "" }),
+      title: canPlay ? "Save this filter as a named channel"
+        : "Pick at least one tag first",
+      onClick: () => navigate("channelSetup", filterToQuery(tagFilter)),
+    }, [el("span", { html: ICON.tv }), "Save as channel\u2026"]),
+  ]);
+
+  c.appendChild(tagFilterBar(tagData.tags || [], rerun, tagFilter, {
+    label: "Tags",
+    extra: actions,
+    facets: data.facets,
+    hint: tagData.tags && tagData.tags.length
+      ? "Click once to include (+), twice to exclude (\u2212), a third time to clear."
+      : "No tags yet \u2014 open a video and add some.",
+  }));
+
+  const summary = filterSummary(tagFilter);
+  c.appendChild(el("div", { class: "section-title" }, [
+    `${data.total} video${data.total === 1 ? "" : "s"}`,
+    summary ? el("span", { style: "color:var(--text-faint);font-weight:400" }, ` \u00b7 ${summary}`) : null,
+  ]));
+
+  if (!data.videos.length) {
+    c.appendChild(el("div", { class: "empty" }, [
+      el("h2", {}, filterIsEmpty(tagFilter) ? "Pick a tag to start" : "No matches"),
+      el("p", {}, filterIsEmpty(tagFilter)
+        ? "Click any tag above to include it in the filter."
+        : tagFilter.mode === "all" && tagFilter.include.length > 1
+          ? "No video carries every included tag. Try Match any."
+          : "Try removing an excluded tag."),
+    ]));
+    return;
+  }
+
+  const pages = Math.ceil(data.total / PAGE_SIZE);
+  if (pages > 0 && tagFilter.page >= pages) return repage(0);
+
+  if (state.selectMode) {
+    c.appendChild(selectToolbar(() => renderTagFilter(arg)));
+  } else {
+    c.appendChild(sortBar(rerun, el("button", {
+      class: "btn",
+      onClick: () => { state.selectMode = true; state.selected.clear(); renderTagFilter(arg); },
+    }, [el("span", { html: ICON.check }), "Select"])));
+  }
+  c.appendChild(videoGrid(data.videos));
+  const pg = pager(data.total, PAGE_SIZE, tagFilter.page, repage);
+  if (pg) c.appendChild(pg);
 }
 
 async function renderUntagged() {
@@ -3062,6 +3952,17 @@ async function renderTagVideos(name) {
   ]));
   c.appendChild(el("div", { class: "page-head" }, [
     el("h1", { class: "page-title" }, `#${name}`),
+    el("div", { class: "spacer" }),
+    // Jump into the filter view pre-seeded with this tag, so narrowing further
+    // (add another tag, exclude one) is one click away from any tag page.
+    el("button", {
+      class: "btn", title: "Add or exclude more tags",
+      onClick: () => {
+        tagFilter.q = ""; tagFilter.mode = "all"; tagFilter.page = 0;
+        tagFilter.include = [name]; tagFilter.exclude = [];
+        navigate("tagfilter", tagFilterToHash());
+      },
+    }, "Refine\u2026"),
   ]));
 
   if (!data.videos.length) {
@@ -3088,18 +3989,38 @@ async function renderTagVideos(name) {
 }
 
 /* ---------------------------------------------------------- channel mode */
-async function renderChannelSetup() {
+// The builder doubles as the editor. `arg` is a query string: a tag filter to
+// start from (any=/all=/exclude=, as produced by the Tags > Filter page), or
+// edit=<id> to load an existing channel.
+async function renderChannelSetup(arg) {
   state.view = "channelSetup";
   document.querySelectorAll(".nav-item").forEach((n) => n.classList.remove("active"));
   highlightTree();
   const c = main();
   c.innerHTML = "";
-  c.appendChild(el("div", { class: "page-head" }, [el("h1", { class: "page-title" }, "Create a channel")]));
+
+  const q = new URLSearchParams(arg || "");
+  const editId = parseInt(q.get("edit"), 10) || null;
+  const seed = filterFromQuery({ include: [], exclude: [], mode: "any", q: "" }, arg);
+
+  let existing = null;
+  if (editId) {
+    existing = (state.channels || []).find((ch) => ch.id === editId) || null;
+    if (!existing) {
+      const d = await api.get("/api/channels").catch(() => ({ channels: [] }));
+      existing = (d.channels || []).find((ch) => ch.id === editId) || null;
+    }
+    if (!existing) { toast("That channel no longer exists"); navigate("channel"); return; }
+  }
+
+  c.appendChild(el("div", { class: "page-head" }, [
+    el("h1", { class: "page-title" }, existing ? `Edit \u201c${existing.name}\u201d` : "Create a channel"),
+  ]));
 
   const setup = el("div", { class: "channel-setup" });
   const box = el("div", { class: "card-lg" });
   box.appendChild(el("p", { style: "margin-top:0;color:var(--text-dim)" },
-    "A channel plays videos at random without repeats, then loops once everything has aired. Combine any folders and tags — a video is included if it's in one of the folders or has one of the tags."));
+    "A channel plays videos at random without repeats, then loops once everything has aired. A video is included if it's in one of the folders or matches the included tags \u2014 and then only if it carries none of the excluded ones."));
 
   // name
   box.appendChild(el("label", {}, "Channel name"));
@@ -3107,80 +4028,144 @@ async function renderChannelSetup() {
     type: "text", placeholder: "e.g. Background Cooking",
     class: "theme", style: "width:100%;height:40px;margin-bottom:20px;padding:0 12px",
   });
+  if (existing) nameInput.value = existing.name;
   box.appendChild(nameInput);
 
   // folders (multi)
   box.appendChild(el("label", {}, "Folders (includes subfolders)"));
   const folderList = el("div", { class: "folder-check-list", style: "margin-bottom:20px" });
-  const selectedFolders = new Set();
+  const selectedFolders = new Set(existing ? existing.folders : []);
   const mkFolderCheck = (value, label, indent) => {
     const cb = el("input", { type: "checkbox" });
     cb.addEventListener("change", () => {
       if (cb.checked) selectedFolders.add(value); else selectedFolders.delete(value);
+      schedulePreview();
     });
-    if (state.path && value === state.path) { cb.checked = true; selectedFolders.add(value); }
+    if (selectedFolders.has(value)) cb.checked = true;
+    // A brand-new channel starts from the folder you were looking at, unless
+    // you arrived carrying a tag filter — then the tags are the point.
+    else if (!existing && !seed.include.length && !seed.exclude.length
+             && state.path && value === state.path) {
+      cb.checked = true; selectedFolders.add(value);
+    }
     return el("label", { class: "folder-check", style: `padding-left:${8 + indent * 14}px` }, [cb, label]);
   };
   folderList.appendChild(mkFolderCheck("", "Entire library", 0));
   state.tree.forEach((f) => folderList.appendChild(mkFolderCheck(f.path, `${f.name} (${f.count})`, f.depth + 1)));
   box.appendChild(folderList);
 
-  // tags (multi)
-  box.appendChild(el("label", {}, "Tags (optional)"));
-  const tagWrap = el("div", { class: "tag-pick" });
-  const selectedTags = new Set();
-  try {
-    const td = await api.get("/api/tags");
-    if (!td.tags.length) tagWrap.appendChild(el("span", { style: "color:var(--text-faint);font-size:13px" }, "No tags defined yet."));
-    td.tags.forEach((t) => {
-      const chip = el("div", { class: "chip" }, `${t.name} (${t.count})`);
-      chip.addEventListener("click", () => {
-        if (selectedTags.has(t.name)) { selectedTags.delete(t.name); chip.classList.remove("on"); }
-        else { selectedTags.add(t.name); chip.classList.add("on"); }
-      });
-      tagWrap.appendChild(chip);
-    });
-  } catch (e) {}
-  box.appendChild(tagWrap);
+  // tags — the same tri-state chips as the Tags > Filter page, so a filter you
+  // built there reads identically here.
+  const rule = existing
+    ? { include: [...existing.tags], exclude: [...(existing.exclude_tags || [])],
+        mode: existing.tag_mode === "all" ? "all" : "any", q: "" }
+    : { include: [...seed.include], exclude: [...seed.exclude], mode: seed.mode, q: "" };
 
-  const createChannel = async (thenPlay) => {
+  box.appendChild(el("label", {}, "Tags"));
+  const tagHost = el("div", { style: "margin-bottom:6px" });
+  box.appendChild(tagHost);
+
+  const countLine = el("div", { class: "channel-count" }, "\u2026");
+  box.appendChild(countLine);
+
+  let allTags = [];
+  const drawTags = () => {
+    tagHost.innerHTML = "";
+    if (!allTags.length) {
+      tagHost.appendChild(el("div", { style: "color:var(--text-faint);font-size:13px;padding:2px 0 10px" },
+        "No tags defined yet."));
+      return;
+    }
+    tagHost.appendChild(tagFilterBar(allTags, () => { drawTags(); schedulePreview(); }, rule, {
+      label: "Include and exclude",
+      hint: "Click once to include (+), twice to exclude (\u2212), a third time to clear.",
+    }));
+  };
+
+  let previewTimer = null;
+  const runPreview = async () => {
+    const body = {
+      folders: [...selectedFolders], tags: rule.include,
+      exclude_tags: rule.exclude, tag_mode: rule.mode,
+    };
+    if (!body.folders.length && !body.tags.length) {
+      countLine.textContent = "Pick at least one folder or tag.";
+      countLine.classList.remove("warn");
+      return;
+    }
+    try {
+      const d = await api.post("/api/channels/preview", body);
+      countLine.textContent = `${d.count} video${d.count === 1 ? "" : "s"} in this channel`;
+      countLine.classList.toggle("warn", d.count === 0);
+    } catch (e) { countLine.textContent = ""; }
+  };
+  const schedulePreview = () => {
+    clearTimeout(previewTimer);
+    previewTimer = setTimeout(runPreview, 120);
+  };
+
+  try { allTags = (await api.get("/api/tags")).tags || []; } catch (e) {}
+  drawTags();
+  runPreview();
+
+  const save = async (thenPlay) => {
     const name = nameInput.value.trim();
-    const folders = [...selectedFolders];
-    const tags = [...selectedTags];
+    const body = {
+      name, folders: [...selectedFolders], tags: rule.include,
+      exclude_tags: rule.exclude, tag_mode: rule.mode,
+    };
     if (!name) { toast("Give the channel a name"); return; }
-    if (!folders.length && !tags.length) { toast("Pick at least one folder or tag"); return; }
-    let res;
-    try { res = await api.post("/api/channels", { name, folders, tags }); }
-    catch (e) { toast(e.message || "Could not create channel"); return; }
+    if (!body.folders.length && !body.tags.length) { toast("Pick at least one folder or tag"); return; }
+    let id = editId;
+    try {
+      if (editId) await api.patch(`/api/channels/${editId}`, body);
+      else id = (await api.post("/api/channels", body)).id;
+    } catch (e) { toast(e.message || "Could not save the channel"); return; }
     await loadChannels();
-    toast(`Channel “${name}” created`);
-    if (thenPlay) startSavedChannel(res.id);
+    toast(editId ? `Channel \u201c${name}\u201d updated` : `Channel \u201c${name}\u201d created`);
+    if (thenPlay) startSavedChannel(id);
     else navigate("browse", "");
   };
 
   box.appendChild(el("div", { class: "row-btns" }, [
-    el("button", { class: "btn primary", style: "height:44px;padding:0 22px", onClick: () => createChannel(false) },
-      [el("span", { html: ICON.tv }), "Create channel"]),
-    el("button", { class: "btn", style: "height:44px;padding:0 22px", onClick: () => createChannel(true) },
-      [el("span", { html: ICON.play }), "Create & play"]),
+    el("button", { class: "btn primary", style: "height:44px;padding:0 22px", onClick: () => save(false) },
+      [el("span", { html: ICON.tv }), existing ? "Save changes" : "Create channel"]),
+    el("button", { class: "btn", style: "height:44px;padding:0 22px", onClick: () => save(true) },
+      [el("span", { html: ICON.play }), existing ? "Save & play" : "Create & play"]),
+    existing ? el("button", {
+      class: "btn ghost", style: "height:44px;padding:0 22px",
+      onClick: () => navigate("browse", ""),
+    }, "Cancel") : null,
   ]));
 
   setup.appendChild(box);
   c.appendChild(setup);
 }
 
-async function startChannel(folder, tags) {
-  const tagStr = (tags || []).join(",");
+// Query string for an unsaved channel. The server keys the rotation off the
+// same values, so two channels with different rules never share a played list.
+function adhocChannelParams(ch) {
+  const p = new URLSearchParams();
+  p.set("folder", ch.folder || "");
+  p.set("tags", (ch.tags || []).join(","));
+  if (ch.exclude && ch.exclude.length) p.set("exclude_tags", ch.exclude.join(","));
+  if (ch.mode === "all") p.set("mode", "all");
+  return p;
+}
+
+async function startChannel(folder, tags, exclude, mode) {
+  const ch = { folder: folder || "", tags: tags || [], exclude: exclude || [], mode: mode || "any" };
+  const p = adhocChannelParams(ch);
   let data;
   try {
     // reset so a freshly started channel begins a clean rotation
-    await api.post(`/api/channel/reset?folder=${encodeURIComponent(folder)}&tags=${encodeURIComponent(tagStr)}`);
-    data = await api.get(`/api/channel/next?folder=${encodeURIComponent(folder)}&tags=${encodeURIComponent(tagStr)}`);
+    await api.post(`/api/channel/reset?${p.toString()}`);
+    data = await api.get(`/api/channel/next?${p.toString()}`);
   } catch (e) {
     toast(e.message || "No videos match this channel");
     return;
   }
-  state.channel = { folder, tags: tags || [], key: data.channel_key, poolSize: data.pool_size };
+  state.channel = { ...ch, key: data.channel_key, poolSize: data.pool_size };
   renderChannelPlayer(data);
 }
 
@@ -3215,6 +4200,24 @@ function renderChannelPlayer(data) {
 
   video.addEventListener("ended", nextChannel);
 
+  // An unplayable file would otherwise leave the channel stuck on a blank
+  // screen. Skip it, but stop after a run of failures so a channel made up of
+  // unplayable files can't spin through the API forever.
+  video.addEventListener("playing", () => { state.channel && (state.channel.failStreak = 0); });
+  video.addEventListener("error", () => {
+    const err = video.error;
+    if (!err || err.code === MediaError.MEDIA_ERR_ABORTED || !state.channel) return;
+    if (state.channel.current !== v) return;   // a newer video has replaced this one
+    const streak = (state.channel.failStreak || 0) + 1;
+    state.channel.failStreak = streak;
+    if (streak >= 5) {
+      toast(`Stopped: the last ${streak} videos couldn't be played in this browser`);
+      return;
+    }
+    toast(`Skipped "${v.title}": ${playbackErrorSummary(v, err.code)}`);
+    nextChannel();
+  });
+
   // Chrome (bug, info overlay, exit button) shows on mouse move and fades
   // together when idle, for a clean full-screen channel experience.
   const chrome = [bug, info, closeBtn];
@@ -3239,7 +4242,10 @@ function channelLabel() {
   if (ch.name) return ch.name;
   const parts = [];
   if (ch.folder) parts.push(ch.folder.split("/").pop());
-  if (ch.tags && ch.tags.length) parts.push("#" + ch.tags.join(" #"));
+  if (ch.tags && ch.tags.length) {
+    parts.push((ch.mode === "all" ? "all " : "") + "#" + ch.tags.join(" #"));
+  }
+  if (ch.exclude && ch.exclude.length) parts.push("\u2212#" + ch.exclude.join(" #"));
   if (!parts.length) parts.push("All");
   return parts.join(" · ");
 }
@@ -3270,10 +4276,9 @@ async function nextChannel() {
     if (ch.savedId != null) {
       data = await api.get(`/api/channels/${ch.savedId}/next?exclude=${cur}`);
     } else {
-      const tagStr = (ch.tags || []).join(",");
-      data = await api.get(
-        `/api/channel/next?folder=${encodeURIComponent(ch.folder || "")}&tags=${encodeURIComponent(tagStr)}&exclude=${cur}`
-      );
+      const p = adhocChannelParams(ch);
+      p.set("exclude", String(cur));
+      data = await api.get(`/api/channel/next?${p.toString()}`);
     }
     renderChannelPlayer(data);
   } catch (e) {
@@ -3295,38 +4300,182 @@ function closeChannel() {
 
 /* ------------------------------------------------------------- search */
 let searchTimer;
-async function renderSearch(q) {
+/* --------------------------------------------------------- filter state */
+// Tri-state tag chips: neutral -> include -> exclude -> neutral. Kept in the
+// URL hash so a filtered view can be bookmarked, shared and reached by Back.
+const filterState = { include: [], exclude: [], mode: "all", q: "" };
+
+// The same shape drives the topbar search and the Tags > Filter page, so the
+// helpers take the state to work on rather than reaching for the global.
+function filterToQuery(st) {
+  const p = new URLSearchParams();
+  if (st.q) p.set("q", st.q);
+  if (st.include.length) {
+    p.set(st.mode === "all" ? "all" : "any", st.include.join(","));
+  }
+  if (st.exclude.length) p.set("exclude", st.exclude.join(","));
+  return p.toString();
+}
+
+// `fallbackMode` applies when the query names no included tags (an empty or
+// exclude-only filter), so the next tag picked uses the page's default.
+function filterFromQuery(st, arg, fallbackMode = "any") {
+  const p = new URLSearchParams(arg || "");
+  st.q = p.get("q") || "";
+  const all = p.get("all"), any = p.get("any");
+  st.mode = all ? "all" : any ? "any" : fallbackMode;
+  st.include = (all || any || "").split(",").filter(Boolean);
+  st.exclude = (p.get("exclude") || "").split(",").filter(Boolean);
+  return st;
+}
+
+function filterIsEmpty(st) {
+  return !st.q && !st.include.length && !st.exclude.length;
+}
+
+function filterToHash() { return filterToQuery(filterState); }
+function filterFromHash(arg) { filterFromQuery(filterState, arg, "all"); }
+
+// Human-readable summary of a filter, e.g. `any of beach, surf · not blooper`.
+function filterSummary(st) {
+  const bits = [];
+  if (st.q) bits.push(`\u201c${st.q}\u201d`);
+  if (st.include.length) {
+    bits.push(`${st.mode === "all" ? "all of" : "any of"} ${st.include.join(", ")}`);
+  }
+  if (st.exclude.length) bits.push(`not ${st.exclude.join(", ")}`);
+  return bits.join(" \u00b7 ");
+}
+
+// One chip per tag. Clicking cycles its state; the bar is rebuilt from the
+// state each time so the chips and the results can never disagree.
+function tagFilterBar(tags, onChange, st = filterState, opts = {}) {
+  const wrap = el("div", { class: "filter-bar" });
+
+  const modeBtn = el("button", {
+    class: "btn chip-mode" + (st.mode === "all" ? " on" : ""),
+    title: st.mode === "all"
+      ? "Videos must have every included tag" : "Videos need at least one included tag",
+    onClick: () => { st.mode = st.mode === "any" ? "all" : "any"; onChange(); },
+  }, st.mode === "all" ? "Match all" : "Match any");
+
+  wrap.appendChild(el("div", { class: "filter-head" }, [
+    el("span", { class: "filter-label" }, opts.label || "Filter by tag"),
+    // Shown from the first included tag, so Match any can be picked before
+    // drill-down hides the tags that don't co-occur with it.
+    st.include.length ? modeBtn : null,
+    el("div", { class: "spacer" }),
+    opts.extra || null,
+    filterIsEmpty(st) ? null : el("button", {
+      class: "btn ghost",
+      onClick: () => { st.include = []; st.exclude = []; onChange(); },
+    }, "Clear"),
+  ]));
+
+  // Drill-down: with Match all, adding a tag can only narrow the results, so
+  // show each tag's count within the current results and hide the tags no
+  // matching video carries. Match any widens instead (another tag adds its
+  // videos), so there the library-wide counts are the meaningful ones.
+  const drill = !!opts.facets && st.mode === "all" && !filterIsEmpty(st);
+  const facetCount = new Map((opts.facets || []).map((f) => [f.name, f.count]));
+  let hidden = 0;
+
+  const chips = el("div", { class: "chips" });
+  tags.forEach((t) => {
+    const name = t.name !== undefined ? t.name : t;
+    const inc = st.include.includes(name);
+    const exc = st.exclude.includes(name);
+    let count = t.count;
+    if (drill) {
+      count = facetCount.get(name) || 0;
+      // Selected chips always stay so they can be cleared; an excluded tag
+      // reads 0 by definition, so its count is left off.
+      if (!count && !inc && !exc) { hidden++; return; }
+      if (exc) count = undefined;
+    }
+    chips.appendChild(el("button", {
+      class: "chip" + (inc ? " inc" : exc ? " exc" : ""),
+      title: inc ? "Included \u2014 click to exclude"
+        : exc ? "Excluded \u2014 click to clear" : "Click to include",
+      onClick: () => {
+        // neutral -> include -> exclude -> neutral
+        st.include = st.include.filter((x) => x !== name);
+        st.exclude = st.exclude.filter((x) => x !== name);
+        if (!inc && !exc) st.include.push(name);
+        else if (inc) st.exclude.push(name);
+        onChange();
+      },
+    }, [
+      el("span", { class: "chip-sign" }, inc ? "+" : exc ? "\u2212" : ""),
+      name,
+      count !== undefined ? el("span", { class: "chip-count" }, String(count)) : null,
+    ]));
+  });
+  wrap.appendChild(chips);
+  if (hidden) {
+    wrap.appendChild(el("div", { class: "filter-hint" },
+      `${hidden} tag${hidden === 1 ? "" : "s"} hidden: no video in the current results ` +
+      `carries ${hidden === 1 ? "it" : "them"}. Counts show how many results have each tag.`));
+  }
+  if (opts.hint) {
+    wrap.appendChild(el("div", { class: "filter-hint" }, opts.hint));
+  }
+  return wrap;
+}
+
+async function renderSearch(arg) {
   state.view = "search";
+  filterFromHash(arg);
+  state.searchQuery = filterState.q;
   const c = main();
   c.innerHTML = `<div class="empty"><div class="spinner" style="margin:0 auto"></div></div>`;
-  // Client-side filter over a full browse of the library root is heavy; instead
-  // we scan the flat video list via the tree's counts is not enough — do a
-  // dedicated fetch of everything under root and filter.
-  const data = await api.get(`/api/browse?path=`);
-  // gather all videos recursively by walking tree folders
-  const all = [];
-  const seen = new Set();
-  const collect = async (path) => {
-    const d = await api.get(`/api/browse?path=${encodeURIComponent(path)}`);
-    d.videos.forEach((v) => { if (!seen.has(v.id)) { seen.add(v.id); all.push(v); } });
-    for (const f of d.folders) await collect(f.path);
-  };
-  await collect("");
-  const ql = q.toLowerCase();
-  const matches = all.filter((v) =>
-    v.title.toLowerCase().includes(ql) || v.rel_path.toLowerCase().includes(ql)
-  );
-  c.innerHTML = "";
-  c.appendChild(el("div", { class: "page-head" }, [
-    el("h1", { class: "page-title" }, `Search: “${q}”`),
-  ]));
-  c.appendChild(el("p", { style: "color:var(--text-dim);margin-top:-8px" }, `${matches.length} result${matches.length === 1 ? "" : "s"}`));
-  if (!matches.length) {
-    c.appendChild(el("div", { class: "empty" }, [el("h2", {}, "No matches")]));
+
+  // One request, filtered in SQL. The previous version walked every folder over
+  // HTTP and filtered in the browser, which got slower with each new folder.
+  const p = new URLSearchParams();
+  if (filterState.q) p.set("q", filterState.q);
+  if (filterState.include.length) {
+    p.set(filterState.mode === "all" ? "all" : "any", filterState.include.join(","));
+  }
+  if (filterState.exclude.length) p.set("exclude", filterState.exclude.join(","));
+  p.set("sort", state.sort.field);
+  p.set("order", state.sort.order);
+  p.set("facets", "1");
+
+  let data, tagData;
+  try {
+    [data, tagData] = await Promise.all([
+      api.get(`/api/search?${p.toString()}`),
+      api.get("/api/tags"),
+    ]);
+  } catch (e) {
+    c.innerHTML = "";
+    c.appendChild(el("div", { class: "empty" }, [el("h2", {}, "Search failed")]));
     return;
   }
-  c.appendChild(viewBar(() => renderSearch(q)));
-  c.appendChild(videoGrid(matches));
+
+  const rerun = () => navigate("search", filterToHash());
+  const summary = filterSummary(filterState);
+
+  c.innerHTML = "";
+  c.appendChild(el("div", { class: "page-head" }, [
+    el("h1", { class: "page-title" }, summary ? `Filter: ${summary}` : "All videos"),
+  ]));
+  c.appendChild(el("p", { style: "color:var(--text-dim);margin-top:-8px" },
+    `${data.total} result${data.total === 1 ? "" : "s"}`));
+  c.appendChild(tagFilterBar(tagData.tags || [], rerun, filterState, { facets: data.facets }));
+
+  if (!data.videos.length) {
+    c.appendChild(el("div", { class: "empty" }, [
+      el("h2", {}, "No matches"),
+      el("p", {}, filterState.exclude.length
+        ? "Try removing an excluded tag, or switch Match all to Match any."
+        : "Try a different tag or search term."),
+    ]));
+    return;
+  }
+  c.appendChild(viewBar(rerun));
+  c.appendChild(videoGrid(data.videos));
 }
 
 /* ---------------------------------------------------------- indexing UI */
@@ -3354,6 +4503,7 @@ function scanSummary(last) {
   if (last.moved) bits.push(`${last.moved} renamed or moved`);
   if (last.updated) bits.push(`${last.updated} updated`);
   if (last.removed) bits.push(`${last.removed} removed`);
+  if (last.thumbs_removed) bits.push(`${last.thumbs_removed} stale thumbnail${last.thumbs_removed === 1 ? "" : "s"} cleaned`);
   return bits.length ? `Library updated · ${bits.join(" · ")}` : "Library up to date";
 }
 
@@ -3445,6 +4595,20 @@ async function loadTree() {
   highlightTree();
 }
 
+// What a saved channel actually matches, for its sidebar tooltip.
+function channelRuleText(ch) {
+  const bits = [];
+  const folders = (ch.folders || []).map((f) => f || "Entire library");
+  if (folders.length) bits.push(folders.join(", "));
+  if (ch.tags && ch.tags.length) {
+    bits.push(`${ch.tag_mode === "all" ? "all of" : "any of"} #${ch.tags.join(" #")}`);
+  }
+  if (ch.exclude_tags && ch.exclude_tags.length) {
+    bits.push(`not #${ch.exclude_tags.join(" #")}`);
+  }
+  return `${ch.name}\n${bits.join(" \u00b7 ")}`;
+}
+
 async function loadChannels() {
   const data = await api.get("/api/channels").catch(() => ({ channels: [] }));
   state.channels = data.channels;
@@ -3457,8 +4621,16 @@ async function loadChannels() {
   state.channels.forEach((ch) => {
     const item = el("div", { class: "chan-item", onClick: () => startSavedChannel(ch.id) }, [
       el("span", { class: "ci-ic", html: ICON.tv }),
-      el("span", { class: "ci-name", title: ch.name }, ch.name),
+      el("span", { class: "ci-name", title: channelRuleText(ch) }, ch.name),
       el("span", { class: "ci-count" }, String(ch.count)),
+      el("span", {
+        class: "ci-edit", title: "Edit this channel",
+        html: ICON.pencil,
+        onClick: (ev) => {
+          ev.stopPropagation();
+          navigate("channelSetup", `edit=${ch.id}`);
+        },
+      }),
       el("span", {
         class: "ci-del", title: "Delete channel",
         onClick: async (ev) => {
@@ -3503,15 +4675,21 @@ function buildHash(type, arg) {
     case "vr":      return "#/vr";
     case "settings": return "#/settings";
     case "duplicates": return "#/duplicates";
+    case "incompatible": return "#/incompatible";
     case "history": return "#/history";
     case "new":     return "#/new";
     case "favorites": return "#/favorites";
     case "tags":    return "#/tags";
     case "untagged": return "#/untagged";
     case "tag":     return "#/tag/" + encodeURIComponent(arg || "");
+    // Like search, these args are query strings that URLSearchParams has
+    // already encoded; encoding again would escape their own separators.
+    case "tagfilter": return "#/tagfilter/" + (arg || "");
     case "channel":
-    case "channelSetup": return "#/channel";
-    case "search":  return "#/search/" + encodeURIComponent(arg || "");
+    case "channelSetup": return "#/channel" + (arg ? "/" + arg : "");
+    // The search arg is a query string (q=&any=&exclude=), already encoded by
+    // URLSearchParams — encoding it again would escape its own separators.
+    case "search":  return "#/search/" + (arg || "");
     case "browse":
     default:        return "#/browse/" + encodeURIComponent(arg || "");
   }
@@ -3594,7 +4772,10 @@ function routeView() {
   const raw = location.hash.replace(/^#\/?/, "");
   const idx = raw.indexOf("/");
   const type = idx === -1 ? raw : raw.slice(0, idx);
-  const arg = idx === -1 ? "" : decodeURIComponent(raw.slice(idx + 1));
+  const rawArg = idx === -1 ? "" : raw.slice(idx + 1);
+  // These carry a query string, which URLSearchParams decodes itself.
+  const QUERY_ROUTES = new Set(["search", "tagfilter", "channel"]);
+  const arg = QUERY_ROUTES.has(type) ? rawArg : decodeURIComponent(rawArg);
   switch (type) {
     case "video":   return renderVideo(parseInt(arg, 10));
     case "allvideos":
@@ -3603,14 +4784,16 @@ function routeView() {
     case "vr":      return renderVR();
     case "settings": return renderSettings();
     case "duplicates": return renderDuplicates();
+    case "incompatible": return renderIncompatible();
     case "new":     return renderNew();
     case "history": return renderHistory();
     case "favorites": return renderFavorites();
     case "tags":    return renderTags();
     case "untagged": return renderUntagged();
     case "tag":     return renderTagVideos(arg);
-    case "channel": return renderChannelSetup();
-    case "search":  state.searchQuery = arg; return renderSearch(arg);
+    case "tagfilter": return renderTagFilter(arg);
+    case "channel": return renderChannelSetup(arg);
+    case "search":  return renderSearch(arg);
     case "browse":
     case "":
     default:        state.view = "browse"; state.path = arg; return renderBrowse();
@@ -3696,7 +4879,10 @@ async function init() {
     const q = e.target.value.trim();
     clearTimeout(searchTimer);
     if (!q) { if (state.view === "search") go("browse", ""); return; }
-    searchTimer = setTimeout(() => navigate("search", q, true), 350);
+    searchTimer = setTimeout(() => {
+      filterState.q = q;   // keep any tag chips already selected
+      navigate("search", filterToHash(), true);
+    }, 350);
   });
 
   await loadTree();

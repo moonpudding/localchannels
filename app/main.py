@@ -29,7 +29,7 @@ from fastapi.responses import (
 from fastapi.staticfiles import StaticFiles
 
 from .config import config
-from . import about, ai, backup, db, indexer
+from . import about, ai, backup, compat, db, indexer, report
 
 @asynccontextmanager
 async def _lifespan(app: "FastAPI"):
@@ -283,7 +283,8 @@ SETTING_DEFAULTS = {
 
 # Settings stored as "0"/"1"; anything truthy-looking is normalised on save.
 _BOOL_SETTINGS = {"filename_tags_auto", "filename_tags_strip_title",
-                  "backup_include_thumbs", "warn_unwritten_tags"}
+                  "backup_include_thumbs", "warn_unwritten_tags",
+                  "ai_disable_thinking"}
 
 # Saving any of these changes how titles are derived, so drop the cache.
 _TITLE_SETTINGS = {"filename_tags_strip_title", "filename_tag_brackets"}
@@ -347,6 +348,25 @@ def api_index_status():
     return indexer.STATUS
 
 
+@app.get("/api/thumbnails/orphans")
+def api_thumbnail_orphans():
+    """How many cached posters no longer belong to any video."""
+    with db.get_db() as conn:
+        return indexer.orphan_summary(conn)
+
+
+@app.post("/api/thumbnails/cleanup")
+def api_thumbnail_cleanup():
+    # A running scan is still writing posters for rows it hasn't inserted
+    # yet; sweeping under it could delete a brand-new thumbnail. The scan
+    # sweeps for itself when it finishes anyway.
+    if indexer.STATUS["running"]:
+        raise HTTPException(409, "A library scan is running — it will clean up "
+                                 "thumbnails when it finishes")
+    with db.get_db() as conn:
+        return {"ok": True, **indexer.cleanup_thumbnails(conn)}
+
+
 # ---------------------------------------------------------------------------
 # Backup (single file, overwritten each run)
 # ---------------------------------------------------------------------------
@@ -400,7 +420,12 @@ def api_ai_test():
     try:
         reply = ai.test_connection(settings)
     except ai.AIError as e:
-        return JSONResponse({"ok": False, "error": str(e)}, status_code=502)
+        # 200, deliberately. This used to answer 502, which put a misleading
+        # "Bad Gateway" in the access log and — because the client reads the
+        # status text on a failed response — showed the user that instead of
+        # the actual reason the check failed.
+        return {"ok": False, "error": str(e),
+                "model": settings.get("ai_model") or "default"}
     return {"ok": True, "reply": reply[:200],
             "model": settings.get("ai_model") or "default"}
 
@@ -517,21 +542,47 @@ def api_duplicates(method: str = Query("hash"),
                       `tolerance_ms` widens the match window (0 = exact to the
                       millisecond, which is what you want for a large library —
                       second-level rounding groups thousands of unrelated clips).
+
+    Groups the user has dismissed come back marked `ignored` rather than
+    omitted, so the UI can offer to show them again without a second request.
+    A dismissed group that has since gained a member no longer matches its
+    record and so comes back unignored, for review.
     """
     with db.get_db() as conn:
         rows = conn.execute("SELECT * FROM videos").fetchall()
         groups: list[dict] = []
 
+        ignores = db.ignored_dupe_sets(conn)
+
+        def match_ignore(ids: set[int]) -> Optional[int]:
+            """The ignore covering this group, if there is one.
+
+            Subset, not equality. Delete one of three dismissed copies and the
+            remaining two are still covered, so a decision already made isn't
+            put back in front of the user. Gain a copy and nothing covers the
+            group any more, so it returns for review — which is the whole point
+            of storing the member set rather than a fingerprint of the match.
+            """
+            for gid, members in ignores.items():
+                if members and ids <= members:
+                    return gid
+            return None
+
         def emit(items):
             if len(items) < 2:
                 return
             durations = [it["duration"] for it in items if it["duration"] is not None]
+            ids = {it["id"] for it in items}
+            gid = match_ignore(ids)
             groups.append({
                 "videos": [serialize_video(conn, it) for it in items],
                 "size": items[0]["size"],
                 "duration": items[0]["duration"],
                 "duration_min": min(durations) if durations else None,
                 "duration_max": max(durations) if durations else None,
+                "video_ids": sorted(ids),
+                "ignored": gid is not None,
+                "ignore_id": gid,
             })
 
         if method == "size":
@@ -576,7 +627,111 @@ def api_duplicates(method: str = Query("hash"),
                     emit(dups)
 
     groups.sort(key=lambda g: (g["size"] or 0) * len(g["videos"]), reverse=True)
-    return {"method": method, "tolerance_ms": tolerance_ms, "groups": groups}
+    return {
+        "method": method,
+        "tolerance_ms": tolerance_ms,
+        "groups": groups,
+        "ignored": sum(1 for g in groups if g["ignored"]),
+    }
+
+
+@app.post("/api/duplicates/ignore")
+def api_duplicates_ignore(payload: dict = Body(...)):
+    """Dismiss a duplicate group so it stops appearing in scans."""
+    ids = sorted({int(v) for v in (payload.get("video_ids") or [])})
+    if len(ids) < 2:
+        raise HTTPException(400, "A group needs at least two videos")
+    method = payload.get("method") or None
+    with db.get_db() as conn:
+        present = {r["id"] for r in conn.execute(
+            f"SELECT id FROM videos WHERE id IN ({', '.join('?' for _ in ids)})", ids
+        ).fetchall()}
+        missing = [i for i in ids if i not in present]
+        if missing:
+            raise HTTPException(404, "Some of those videos are no longer indexed")
+        # A group that grew re-appears for review; dismissing it again should
+        # replace the earlier, smaller record rather than stack on top of it.
+        for gid, members in db.ignored_dupe_sets(conn).items():
+            if members <= set(ids):
+                db.lift_dupe_ignore(conn, gid)
+        gid = db.ignore_dupe_group(conn, ids, method)
+    return {"ok": True, "ignore_id": gid, "videos": len(ids)}
+
+
+@app.delete("/api/duplicates/ignore/{ignore_id}")
+def api_duplicates_unignore(ignore_id: int):
+    with db.get_db() as conn:
+        db.lift_dupe_ignore(conn, ignore_id)
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Media reports: CSV export and browser-compatibility checks
+# ---------------------------------------------------------------------------
+
+def _scope_label(folder: str, recursive: bool) -> str:
+    f = (folder or "").strip("/")
+    if not f:
+        return "whole library" if recursive else "library root only"
+    return f"{f}{' and subfolders' if recursive else ' only'}"
+
+
+@app.get("/api/report.csv")
+def api_report_csv(
+    folder: str = Query("", description="folder relative to the library root; empty = everything"),
+    recursive: bool = Query(True, description="include subfolders"),
+    detailed: bool = Query(False, description="re-probe every file with ffprobe for "
+                                              "tracks, languages, embedded tags and chapters"),
+    only_issues: bool = Query(False, description="only files browsers can't (fully) play"),
+):
+    """Per-file media report as CSV, streamed so big detailed reports don't time out."""
+    with db.get_db() as conn:
+        rows = report.scoped_videos(conn, folder, recursive)
+        maps = report._bulk_maps(conn)
+    if only_issues:
+        rows = [r for r in rows
+                if compat.classify(r["rel_path"], r["container"], r["vcodec"],
+                                   r["acodec"])["issues"]]
+    name = report.filename_for(folder, recursive, detailed, only_issues)
+    return StreamingResponse(
+        report.csv_stream(rows, maps, detailed),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{name}"',
+                 "X-Report-Rows": str(len(rows))},
+    )
+
+
+@app.get("/api/incompatible")
+def api_incompatible(folder: str = Query(""), recursive: bool = Query(True)):
+    """Files browsers can't play, or play only in some setups, with fix commands."""
+    with db.get_db() as conn:
+        out = report.incompatible(conn, folder, recursive)
+    out["scope"] = _scope_label(folder, recursive)
+    return out
+
+
+@app.get("/api/incompatible/fix.sh")
+def api_incompatible_script(
+    folder: str = Query(""),
+    recursive: bool = Query(True),
+    kinds: str = Query("", description="issue kinds to include, comma-separated; empty = all"),
+):
+    """Bash script that converts or renames every listed file."""
+    with db.get_db() as conn:
+        items = report.incompatible(conn, folder, recursive)["items"]
+    wanted = set(_csv(kinds))
+    if wanted:
+        items = [it for it in items if wanted & {i["kind"] for i in it["issues"]}]
+    label = _scope_label(folder, recursive)
+    if wanted:
+        label += " (" + ", ".join(compat.ISSUE_LABELS.get(k, k) for k in sorted(wanted)) + ")"
+    scope = (folder or "").strip("/").replace("/", "_") or "library"
+    safe = "".join(ch if ch.isalnum() or ch in "-_." else "-" for ch in scope)
+    return Response(
+        report.fix_script(items, label),
+        media_type="text/x-shellscript; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="localchannels-fix-{safe}.sh"'},
+    )
 
 
 @app.delete("/api/video/{video_id}/file")
@@ -598,7 +753,7 @@ def api_delete_file(video_id: int):
                 deleted = True
             except OSError as e:
                 raise HTTPException(500, f"Could not delete file: {e}")
-        db.delete_video(conn, video_id)
+        indexer.remove_thumbnail(db.delete_video(conn, video_id))
     return {"ok": True, "deleted_file": deleted}
 
 
@@ -611,7 +766,7 @@ def api_remove_from_library(video_id: int):
         if not row:
             raise HTTPException(404, "Video not found")
         db.ignore_file(conn, row["rel_path"])
-        db.delete_video(conn, video_id)
+        indexer.remove_thumbnail(db.delete_video(conn, video_id))
     return {"ok": True, "kept_file": True}
 
 
@@ -639,7 +794,7 @@ def api_bulk_delete(payload: dict = Body(...)):
                     deleted_files += 1
                 except OSError:
                     pass
-            db.delete_video(conn, vid)
+            indexer.remove_thumbnail(db.delete_video(conn, vid))
             removed += 1
     return {"ok": True, "removed": removed, "deleted_files": deleted_files}
 
@@ -776,6 +931,21 @@ def api_stats():
         total = conn.execute("SELECT COUNT(*) AS c FROM videos").fetchone()["c"]
         vr = db.count_vr(conn)
     return {"total": total, "vr": vr}
+
+
+@app.get("/api/stats/library")
+def api_library_stats():
+    """Everything behind Settings → Statistics."""
+    with db.get_db() as conn:
+        stats = db.library_stats(conn)
+        # Attach display titles wherever a specific video is referenced, so
+        # the page shows the same clean names as the rest of the app.
+        for v in stats["popular"]:
+            v["title"] = display_title(conn, v.pop("filename"))
+        for rec in stats["records"].values():
+            if rec:
+                rec["title"] = display_title(conn, rec.pop("filename"))
+    return stats
 
 
 @app.post("/api/video/{video_id}/vr")
@@ -1193,6 +1363,60 @@ def api_untagged(sort: str = Query("name"), order: str = Query("asc")):
     return {"videos": videos, "total": len(videos)}
 
 
+def _csv(value: str) -> list[str]:
+    """Split a comma-separated query parameter into clean names."""
+    return [p.strip() for p in (value or "").split(",") if p.strip()]
+
+
+@app.get("/api/search")
+def api_search(
+    q: str = Query("", description="substring of the file path"),
+    # aliases keep the query string readable without shadowing any()/all()
+    any_: str = Query("", alias="any", description="tags; match at least one"),
+    all_: str = Query("", alias="all", description="tags; must have every one"),
+    exclude: str = Query("", description="tags; must have none of these"),
+    folder: str = Query("", description="restrict to this folder and subfolders"),
+    untagged: bool = Query(False, description="only videos with no tags"),
+    sort: str = Query("name"),
+    order: str = Query("asc"),
+    limit: int = Query(0, ge=0, le=2000, description="0 returns everything"),
+    offset: int = Query(0, ge=0),
+    facets: bool = Query(False, description="also return per-tag counts over "
+                                            "the whole result set"),
+):
+    """Filter the library by tags and/or text.
+
+    Replaces the old client-side search, which fetched every folder over HTTP
+    and filtered in the browser. The three tag clauses are ANDed, so
+    any=beach,surf & exclude=blooper reads as "beach or surf, but not blooper".
+    """
+    col = _sort_column(sort)
+    direction = "DESC" if str(order).lower() == "desc" else "ASC"
+    filters = dict(
+        any_tags=_csv(any_),
+        all_tags=_csv(all_),
+        not_tags=_csv(exclude),
+        text=q,
+        folder=folder,
+        untagged=untagged,
+    )
+    with db.get_db() as conn:
+        rows, total = db.filter_videos(
+            conn,
+            order_by=f"{col} {direction}",
+            limit=limit or None,
+            offset=offset,
+            **filters,
+        )
+        videos = [serialize_video(conn, r) for r in rows]
+        out = {"videos": videos, "total": total, "count": len(videos)}
+        if facets:
+            # Tags that co-occur with the current filter, counted over every
+            # match (not just this page), for drill-down in the filter UI.
+            out["facets"] = db.filter_tag_counts(conn, **filters)
+    return out
+
+
 @app.get("/api/tag/{name}")
 def api_tag_videos(name: str):
     with db.get_db() as conn:
@@ -1205,45 +1429,98 @@ def api_tag_videos(name: str):
 # Channel mode: shuffle-without-replacement over a folder (+subfolders)/tags
 # ---------------------------------------------------------------------------
 
-def _channel_key(folder: str, tags: list[str]) -> str:
-    raw = folder + "|" + ",".join(sorted(t.lower() for t in tags))
+def _channel_key(folder: str, tags: list[str],
+                 exclude_tags: Optional[list[str]] = None,
+                 tag_mode: str = "any") -> str:
+    """Stable identity for an unsaved channel.
+
+    Every part of the definition goes in, so changing the rule starts a fresh
+    rotation instead of inheriting the "already played" list of a channel that
+    no longer exists.
+    """
+    raw = "|".join([
+        folder,
+        ",".join(sorted(t.lower() for t in tags)),
+        ",".join(sorted(t.lower() for t in (exclude_tags or []))),
+        "all" if tag_mode == "all" else "any",
+    ])
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
 
 
-def _pool(conn, folders: list[str], tags: list[str]) -> list[int]:
-    """Video ids for a channel: the UNION of videos in any of the folders
-    (incl. subfolders) and videos with any of the tags. A "" folder entry means
-    the whole library."""
+def _pool(conn, folders: list[str], tags: list[str],
+          exclude_tags: Optional[list[str]] = None,
+          tag_mode: str = "any") -> list[int]:
+    """Video ids for a channel.
+
+    A video is in the pool when it sits in one of the folders (subfolders
+    included) OR carries the required tags, and then only if it carries none of
+    the excluded ones. A "" folder entry means the whole library.
+
+    `tag_mode` applies to the include list alone: "any" takes a video with at
+    least one of the tags, "all" only takes videos carrying every one. The
+    exclusion is always "none of these" — one banned tag is enough to drop a
+    video, which is what makes it useful for pruning a broad include list.
+    """
     raw = [f.strip("/") for f in (folders or [])]
     whole_library = "" in raw
     real_folders = [f for f in raw if f]
-    tags = [t for t in (tags or []) if t.strip()]
-
-    if whole_library:
-        return [r["id"] for r in
-                conn.execute("SELECT id FROM videos ORDER BY rel_path").fetchall()]
+    tags = [t.strip() for t in (tags or []) if t.strip()]
+    exclude_tags = [t.strip() for t in (exclude_tags or []) if t.strip()]
 
     clauses: list = []
     params: list = []
-    if real_folders:
-        subs = []
-        for f in real_folders:
-            subs.append("(folder = ? OR folder LIKE ?)")
-            params.extend([f, f"{f}/%"])
-        clauses.append("(" + " OR ".join(subs) + ")")
-    if tags:
-        ph = ", ".join("?" for _ in tags)
-        clauses.append(
-            "id IN (SELECT vt.video_id FROM video_tags vt "
-            f"JOIN tags t ON t.id = vt.tag_id WHERE LOWER(t.name) IN ({ph}))"
-        )
-        params.extend([t.lower() for t in tags])
+    if whole_library:
+        clauses.append("1")
+    else:
+        if real_folders:
+            subs = []
+            for f in real_folders:
+                subs.append("(folder = ? OR folder LIKE ?)")
+                params.extend([f, f"{f}/%"])
+            clauses.append("(" + " OR ".join(subs) + ")")
+        if tags:
+            ph = ", ".join("?" for _ in tags)
+            if tag_mode == "all":
+                clauses.append(
+                    "(SELECT COUNT(DISTINCT LOWER(t.name)) FROM video_tags vt "
+                    "JOIN tags t ON t.id = vt.tag_id "
+                    f"WHERE vt.video_id = videos.id AND LOWER(t.name) IN ({ph})) = ?"
+                )
+                params.extend([t.lower() for t in tags])
+                params.append(len(set(t.lower() for t in tags)))
+            else:
+                clauses.append(
+                    "id IN (SELECT vt.video_id FROM video_tags vt "
+                    f"JOIN tags t ON t.id = vt.tag_id WHERE LOWER(t.name) IN ({ph}))"
+                )
+                params.extend([t.lower() for t in tags])
     if not clauses:
         return []
+
+    sql = "SELECT id FROM videos WHERE (" + " OR ".join(clauses) + ")"
+    if exclude_tags:
+        ph = ", ".join("?" for _ in exclude_tags)
+        sql += (" AND id NOT IN (SELECT vt.video_id FROM video_tags vt "
+                f"JOIN tags t ON t.id = vt.tag_id WHERE LOWER(t.name) IN ({ph}))")
+        params.extend([t.lower() for t in exclude_tags])
     # ORDER BY rel_path so sequential channels play in a predictable order;
     # random mode ignores it, so this costs nothing there.
-    sql = "SELECT id FROM videos WHERE " + " OR ".join(clauses) + " ORDER BY rel_path"
+    sql += " ORDER BY rel_path"
     return [r["id"] for r in conn.execute(sql, params).fetchall()]
+
+
+def _channel_rule(ch) -> tuple[list, list, list, str]:
+    """Unpack a saved channel row into (folders, tags, exclude_tags, tag_mode).
+
+    Rows created before excludes existed have no such columns, hence the
+    defensive lookup rather than plain indexing.
+    """
+    keys = ch.keys()
+    folders = json.loads(ch["folders"] or "[]")
+    tags = json.loads(ch["tags"] or "[]")
+    exclude = json.loads(ch["exclude_tags"] or "[]") if "exclude_tags" in keys else []
+    mode = (ch["tag_mode"] if "tag_mode" in keys else "any") or "any"
+    return folders, tags, exclude, mode
 
 
 def _serve_next(conn, key: str, pool: list[int], exclude: Optional[int]) -> dict:
@@ -1300,20 +1577,24 @@ def _serve_next(conn, key: str, pool: list[int], exclude: Optional[int]) -> dict
 @app.get("/api/channel/next")
 def api_channel_next(
     folder: str = Query(""),
-    tags: str = Query(""),
+    tags: str = Query("", description="tags to include, comma-separated"),
+    not_tags: str = Query("", alias="exclude_tags",
+                          description="tags to keep out, comma-separated"),
+    mode: str = Query("any", description="any | all, applied to `tags`"),
     exclude: Optional[int] = Query(None, description="video id to avoid repeating"),
 ):
-    tag_list = [t for t in (tags.split(",") if tags else []) if t.strip()]
-    key = _channel_key(folder, tag_list)
+    tag_list, not_list = _csv(tags), _csv(not_tags)
+    key = _channel_key(folder, tag_list, not_list, mode)
     with db.get_db() as conn:
-        pool = _pool(conn, [folder] if folder else [], tag_list)
+        pool = _pool(conn, [folder] if folder else [], tag_list, not_list, mode)
         return _serve_next(conn, key, pool, exclude)
 
 
 @app.post("/api/channel/reset")
-def api_channel_reset(folder: str = Query(""), tags: str = Query("")):
-    tag_list = [t for t in (tags.split(",") if tags else []) if t.strip()]
-    key = _channel_key(folder, tag_list)
+def api_channel_reset(folder: str = Query(""), tags: str = Query(""),
+                      not_tags: str = Query("", alias="exclude_tags"),
+                      mode: str = Query("any")):
+    key = _channel_key(folder, _csv(tags), _csv(not_tags), mode)
     with db.get_db() as conn:
         conn.execute("DELETE FROM channel_played WHERE channel_key = ?", (key,))
     return {"ok": True, "channel_key": key}
@@ -1321,33 +1602,79 @@ def api_channel_reset(folder: str = Query(""), tags: str = Query("")):
 
 # ---- Saved (named) channels --------------------------------------------------
 
+def _serialize_channel(conn, ch) -> dict:
+    folders, tags, exclude, mode = _channel_rule(ch)
+    return {
+        "id": ch["id"], "name": ch["name"],
+        "folders": folders, "tags": tags,
+        "exclude_tags": exclude, "tag_mode": mode,
+        "count": len(_pool(conn, folders, tags, exclude, mode)),
+    }
+
+
 @app.get("/api/channels")
 def api_channels_list():
     with db.get_db() as conn:
-        out = []
-        for ch in db.list_channels(conn):
-            folders = json.loads(ch["folders"])
-            tags = json.loads(ch["tags"])
-            out.append({
-                "id": ch["id"], "name": ch["name"],
-                "folders": folders, "tags": tags,
-                "count": len(_pool(conn, folders, tags)),
-            })
-    return {"channels": out}
+        return {"channels": [_serialize_channel(conn, ch)
+                             for ch in db.list_channels(conn)]}
+
+
+def _channel_payload(payload: dict) -> tuple[str, list, list, list, str]:
+    name = (payload.get("name") or "").strip()
+    folders = [str(f) for f in (payload.get("folders") or [])]
+    tags = [str(t).strip() for t in (payload.get("tags") or []) if str(t).strip()]
+    exclude = [str(t).strip() for t in (payload.get("exclude_tags") or [])
+               if str(t).strip()]
+    mode = "all" if payload.get("tag_mode") == "all" else "any"
+    if not name:
+        raise HTTPException(400, "Channel name required")
+    if not folders and not tags:
+        raise HTTPException(400, "Pick at least one folder or tag to include")
+    # An excluded tag that is also included would empty the channel silently,
+    # so say so rather than saving a rule that can never match anything.
+    overlap = {t.lower() for t in tags} & {t.lower() for t in exclude}
+    if overlap:
+        raise HTTPException(
+            400, f"{', '.join(sorted(overlap))} is both included and excluded")
+    return name, folders, tags, exclude, mode
 
 
 @app.post("/api/channels")
 def api_channels_create(payload: dict = Body(...)):
-    name = (payload.get("name") or "").strip()
-    folders = payload.get("folders") or []
-    tags = payload.get("tags") or []
-    if not name:
-        raise HTTPException(400, "Channel name required")
-    if not folders and not tags:
-        raise HTTPException(400, "Pick at least one folder or tag")
+    name, folders, tags, exclude, mode = _channel_payload(payload)
     with db.get_db() as conn:
-        cid = db.create_channel(conn, name, folders, tags)
+        cid = db.create_channel(conn, name, folders, tags, exclude, mode)
     return {"id": cid}
+
+
+@app.patch("/api/channels/{channel_id}")
+def api_channels_update(channel_id: int, payload: dict = Body(...)):
+    name, folders, tags, exclude, mode = _channel_payload(payload)
+    with db.get_db() as conn:
+        if not db.get_channel(conn, channel_id):
+            raise HTTPException(404, "Channel not found")
+        db.update_channel(conn, channel_id, name, folders, tags, exclude, mode)
+        # The rule changed, so the old rotation no longer describes this channel.
+        conn.execute("DELETE FROM channel_played WHERE channel_key = ?",
+                     (f"saved:{channel_id}",))
+        return _serialize_channel(conn, db.get_channel(conn, channel_id))
+
+
+@app.post("/api/channels/preview")
+def api_channels_preview(payload: dict = Body(default={})):
+    """How many videos a channel rule would match, for the live count in the
+    channel builder. Ids are returned too, capped, so the UI can show a sample
+    without a second round trip."""
+    folders = [str(f) for f in (payload.get("folders") or [])]
+    tags = [str(t).strip() for t in (payload.get("tags") or []) if str(t).strip()]
+    exclude = [str(t).strip() for t in (payload.get("exclude_tags") or [])
+               if str(t).strip()]
+    mode = "all" if payload.get("tag_mode") == "all" else "any"
+    with db.get_db() as conn:
+        pool = _pool(conn, folders, tags, exclude, mode)
+        sample = [serialize_video(conn, db.get_video(conn, vid))
+                  for vid in pool[:12]]
+    return {"count": len(pool), "sample": sample}
 
 
 @app.delete("/api/channels/{channel_id}")
@@ -1366,7 +1693,7 @@ def api_channels_next(channel_id: int, exclude: Optional[int] = Query(None)):
         ch = db.get_channel(conn, channel_id)
         if not ch:
             raise HTTPException(404, "Channel not found")
-        pool = _pool(conn, json.loads(ch["folders"]), json.loads(ch["tags"]))
+        pool = _pool(conn, *_channel_rule(ch))
         data = _serve_next(conn, f"saved:{channel_id}", pool, exclude)
         data["name"] = ch["name"]
         return data

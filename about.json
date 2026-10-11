@@ -13,7 +13,7 @@
   ],
 
   "name": "LocalChannels",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "tagline": "Your own video library, with channels.",
   "description": "A self-hosted web library and player for the videos you already have on disk. Browse by folder, tag and search your collection, resume where you left off, and shuffle a folder or a set of tags into an endless channel.",
 

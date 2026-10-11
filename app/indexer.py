@@ -235,6 +235,67 @@ def make_thumbnail(path: Path, rel_path: str, duration: Optional[float]) -> Opti
     return name if out.exists() and result.returncode == 0 else None
 
 
+def remove_thumbnail(name: Optional[str]) -> bool:
+    """Delete one cached poster by its stored filename. Missing is fine."""
+    if not name:
+        return False
+    try:
+        (config.thumbnail_dir / name).unlink()
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+
+
+def _thumbnail_files() -> list[Path]:
+    try:
+        return [p for p in config.thumbnail_dir.iterdir()
+                if p.is_file() and p.suffix.lower() == ".jpg"]
+    except OSError:
+        return []
+
+
+def orphan_thumbnails(conn) -> list[Path]:
+    """Cached posters that no library row points at any more.
+
+    A poster is orphaned when its video was deleted, removed from the library,
+    or vanished from disk before the cleanup-on-delete code existed. Names are
+    compared, not paths, so this is one directory listing plus one query.
+    """
+    referenced = {
+        r["thumbnail"] for r in
+        conn.execute("SELECT thumbnail FROM videos WHERE thumbnail IS NOT NULL")
+    }
+    return [p for p in _thumbnail_files() if p.name not in referenced]
+
+
+def orphan_summary(conn) -> dict:
+    orphans = orphan_thumbnails(conn)
+    size = 0
+    for p in orphans:
+        try:
+            size += p.stat().st_size
+        except OSError:
+            pass
+    return {"orphans": len(orphans), "bytes": size,
+            "total": len(_thumbnail_files())}
+
+
+def cleanup_thumbnails(conn) -> dict:
+    """Delete every orphaned poster. Returns how many went and their size."""
+    removed = freed = 0
+    for p in orphan_thumbnails(conn):
+        try:
+            size = p.stat().st_size
+            p.unlink()
+        except OSError:
+            continue
+        removed += 1
+        freed += size
+    return {"removed": removed, "bytes": freed}
+
+
 def _iter_videos():
     root = config.root_path
     if not root.exists():
@@ -411,7 +472,17 @@ def reindex(force: bool = False) -> dict:
                 added += 1
             STATUS["done"] += 1
 
-        removed = db.delete_missing(conn, present_rel)
+        STATUS["current"] = "Pruning removed files..."
+        gone_thumbs = db.delete_missing(conn, present_rel)
+        for name in gone_thumbs:
+            remove_thumbnail(name)
+        removed = len(gone_thumbs)
+
+        # Posters can also be orphaned by deletes made before this scan (or by
+        # an older version that never cleaned up), so sweep the directory once
+        # the row set is final. One listdir; cheap next to the probing above.
+        STATUS["current"] = "Cleaning up thumbnails..."
+        thumbs_removed = cleanup_thumbnails(conn)["removed"]
 
     summary = {
         "added": added,
@@ -419,6 +490,7 @@ def reindex(force: bool = False) -> dict:
         "moved": moved,
         "skipped": skipped,
         "removed": removed,
+        "thumbs_removed": thumbs_removed,
         "total": len(files),
     }
     STATUS.update(running=False, current="", finished_at=time.time(), last=summary)

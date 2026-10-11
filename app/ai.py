@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 import subprocess
 import tempfile
 import threading
@@ -41,9 +42,30 @@ AI_SETTING_DEFAULTS = {
     "ai_frame_interval": "60",                   # seconds between frames (interval mode)
     "ai_max_frames": "16",                       # hard cap either way
     "ai_frame_width": "512",                     # frames are downscaled to this width
+    "ai_disable_thinking": "0",                  # ask the server to skip reasoning tokens
 }
 
-REQUEST_TIMEOUT = 600  # seconds for one model call — VLMs can be slow
+REQUEST_TIMEOUT = 600  # seconds for one analysis call — VLMs can be slow
+
+# The connection test is a handful of tokens with no images. Letting it inherit
+# the analysis timeout meant a wedged endpoint held the request open for ten
+# minutes, which reads as "the app is broken" rather than "the endpoint is".
+TEST_TIMEOUT = 45
+
+# Reasoning models emit their scratchpad inline when the server has no reasoning
+# parser configured. It is not part of the summary, so it is stripped.
+_THINK_RE = re.compile(r"<(think|thinking|reasoning)>.*?</\1>", re.S | re.I)
+
+
+def strip_reasoning(text: str) -> str:
+    """Drop <think> blocks, including one left unclosed by a token limit."""
+    text = _THINK_RE.sub("", text or "")
+    # An unterminated block means the model ran out of tokens mid-thought;
+    # everything from the opening tag on is scratchpad, not answer.
+    cut = re.search(r"<(think|thinking|reasoning)>", text, re.I)
+    if cut:
+        text = text[:cut.start()]
+    return text.strip()
 
 # Module-level job progress the API can poll (same pattern as indexer.STATUS).
 STATUS = {
@@ -134,15 +156,22 @@ def chat_url(endpoint: str) -> str:
     return e + "/chat/completions"
 
 
-def _post_chat(settings: dict, messages: list, max_tokens: int = 1024) -> str:
+def _post_chat(settings: dict, messages: list, max_tokens: int = 1024,
+               timeout: Optional[int] = None) -> str:
     """POST to /chat/completions and return the assistant message content."""
     url = chat_url(settings.get("ai_endpoint", ""))
+    timeout = timeout or REQUEST_TIMEOUT
     payload = {
         "model": settings.get("ai_model") or "default",
         "messages": messages,
         "max_tokens": max_tokens,
         "temperature": 0.2,
     }
+    # vLLM passes this through to the chat template; it is what turns off Qwen3
+    # style thinking. Off by default because a server that doesn't know the
+    # field (OpenAI itself, for one) rejects the whole request.
+    if str(settings.get("ai_disable_thinking", "0")) == "1":
+        payload["chat_template_kwargs"] = {"enable_thinking": False}
     headers = {"Content-Type": "application/json"}
     api_key = (settings.get("ai_api_key") or "").strip()
     if api_key:
@@ -151,7 +180,7 @@ def _post_chat(settings: dict, messages: list, max_tokens: int = 1024) -> str:
         url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST"
     )
     try:
-        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         detail = ""
@@ -159,34 +188,66 @@ def _post_chat(settings: dict, messages: list, max_tokens: int = 1024) -> str:
             detail = e.read().decode("utf-8", "replace")[:400]
         except Exception:
             pass
-        raise AIError(f"API returned HTTP {e.code}: {detail or e.reason}")
+        # 502/503/504 come from something in front of the model server, so name
+        # that rather than let it read as a failure of the model itself.
+        hint = ""
+        if e.code in (502, 503, 504):
+            hint = (" — that status comes from a proxy or load balancer in "
+                    "front of the endpoint, not from the model. Check that the "
+                    "server is up and that the proxy's read timeout is longer "
+                    "than the model takes to answer.")
+        raise AIError(f"{url} returned HTTP {e.code}: {detail or e.reason}{hint}")
     except urllib.error.URLError as e:
-        raise AIError(f"Could not reach AI endpoint: {e.reason}")
-    except (TimeoutError, OSError) as e:
-        raise AIError(f"Request failed: {e}")
+        reason = e.reason
+        if isinstance(reason, TimeoutError) or "timed out" in str(reason):
+            raise AIError(f"No response from {url} within {timeout}s")
+        raise AIError(f"Could not reach {url}: {reason}")
+    except TimeoutError:
+        # Raised directly (rather than wrapped in URLError) once the connection
+        # is up and the server simply stops talking.
+        raise AIError(f"No response from {url} within {timeout}s")
+    except OSError as e:
+        raise AIError(f"Request to {url} failed: {e}")
     except json.JSONDecodeError:
         raise AIError("AI endpoint returned invalid JSON")
 
     try:
-        content = data["choices"][0]["message"]["content"]
+        choice = data["choices"][0]
+        content = choice["message"]["content"]
     except (KeyError, IndexError, TypeError):
         raise AIError(f"Unexpected response shape: {str(data)[:300]}")
     if isinstance(content, list):  # some servers return content parts
         content = " ".join(
             p.get("text", "") for p in content if isinstance(p, dict)
         )
-    content = (content or "").strip()
+    content = strip_reasoning(content or "")
     if not content:
+        # Distinguish the two ways of getting nothing back, because they need
+        # opposite fixes: raise the token budget, or turn thinking off.
+        finish = (choice or {}).get("finish_reason")
+        reasoned = ((choice.get("message") or {}).get("reasoning_content") or "").strip()
+        if finish == "length" or reasoned:
+            raise AIError(
+                f"The model used its whole {max_tokens}-token budget on "
+                "reasoning and never produced an answer. Turn on \u201cSkip "
+                "reasoning tokens\u201d below, or use a non-reasoning model."
+            )
         raise AIError("Model returned an empty response")
     return content
 
 
 def test_connection(settings: dict) -> str:
-    """Cheap text-only round trip to verify endpoint/model/key. Returns the reply."""
+    """Cheap text-only round trip to verify endpoint/model/key. Returns the reply.
+
+    The budget is generous for a one-word answer on purpose: a reasoning model
+    asked for ten tokens spends all of them thinking and returns nothing, which
+    looks identical to a broken endpoint.
+    """
     return _post_chat(
         settings,
         [{"role": "user", "content": "Reply with the single word: OK"}],
-        max_tokens=10,
+        max_tokens=512,
+        timeout=TEST_TIMEOUT,
     )
 
 

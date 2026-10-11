@@ -55,7 +55,9 @@ No Docker? See [Run without Docker](#run-without-docker).
 - [Configuration](#configuration)
 - [Themes](#themes)
 - [Password protection](#password-protection)
+- [Filtering by tags](#filtering-by-tags)
 - [Tags and filenames](#tags-and-filenames)
+- [Ignoring duplicate groups](#ignoring-duplicate-groups)
 - [How renames and moves are tracked](#how-renames-and-moves-are-tracked)
 - [AI video summaries](#ai-video-summaries)
 - [Backup and restore](#backup-and-restore)
@@ -80,7 +82,7 @@ No Docker? See [Run without Docker](#run-without-docker).
 - **All Videos** — a flat, paginated view of the whole library (60 per page)
 - **Sorting** — order any listing by name, date added, file date, length,
   resolution (pixel count) or file size, ascending or descending
-- **Video page** — full metadata table and an inline player with HTTP range
+- **Video page** — full metadata table (including file date and date added) and an inline player with HTTP range
   streaming, so seeking works and the browser only pulls the bytes it needs
 - **Resume playback** — remembers where you stopped and offers *Resume* or
   *Play from beginning* when you come back
@@ -98,7 +100,11 @@ No Docker? See [Run without Docker](#run-without-docker).
 - **Shuffle without repeats** — plays random videos until everything has aired,
   then loops. Start one ad-hoc from any folder or tag
 - **Named channels** — build a channel from any combination of folders and tags
-  and keep it in the sidebar for later
+  and keep it in the sidebar for later. Edit the rule later from the pencil on
+  the sidebar entry
+- **Include and exclude tags** — a channel can require tags *and* bar them:
+  "anything tagged tag1, tag2 or tag3, but nothing tagged tag6 or tag7". The
+  builder shows a live count of what the rule matches before you save it
 - **Clean full-screen** — the exit button and overlay fade out with the player
   controls while a channel runs
 
@@ -107,6 +113,11 @@ No Docker? See [Run without Docker](#run-without-docker).
 - **User tags** — add and remove freely, with autocomplete and a one-click
   picker for your 20 most-used tags. The Tags page lists every tag; open one to
   see its videos
+- **Tag filter** — *Tags → Filter by tags* combines tags into one query: click a
+  tag once to require it, again to exclude it. Included tags match on *any* or
+  *all*; excluded tags always win. Results come back as thumbnails or a list,
+  and can be played or saved as a channel in a click. See
+  [Filtering by tags](#filtering-by-tags)
 - **Tags from filenames** — pull space-separated tags out of a bracketed
   section, e.g. `Channel - Title [TECH OC GUIDE].mp4` → `TECH`, `OC`, `GUIDE`.
   Run it across the library on demand, or auto-apply during scans
@@ -170,6 +181,26 @@ No Docker? See [Run without Docker](#run-without-docker).
   an exact file size, or have the same runtime (matched to the millisecond, with
   a selectable tolerance). Remove them from the library or delete the file
   outright; removed files are remembered so a rescan won't re-add them
+- **Ignore a duplicate group** — some matches are meant to be there: two cuts of
+  the same film with different soundtracks share a runtime on purpose. Dismiss
+  the group and it stops appearing — until another copy turns up, at which point
+  it comes back for review. See [Ignoring duplicate
+  groups](#ignoring-duplicate-groups)
+- **Media reports** — *Settings → Media Management* exports a CSV for the whole
+  library or one folder (with or without subfolders): resolution, duration, fps,
+  codecs, bitrate, container, size, extension/container mismatches, browser
+  playability and tags. Detailed mode re-probes every file for track counts,
+  audio/subtitle languages, embedded title/artist/encoder tags and chapters
+- **Browser-incompatible files** — lists files browsers can't play (AVI,
+  MPEG-TS, WMV, MPEG-PS containers; MPEG-4 Part 2, MPEG-2, WMV video; AC-3, DTS,
+  MP2 audio), HEVC files that need hardware decoding, and files whose extension
+  lies about their container. Each comes with a fix command (a lossless remux
+  when the streams allow it, otherwise H.264/AAC), and the list downloads as a
+  bash script. Once a converted copy is in the library, the original is marked
+  as safe to delete
+- **Thumbnail cleanup** — posters are deleted along with their videos, and every
+  scan sweeps the cache for anything left behind. *Settings → Media Management*
+  shows how many stale thumbnails there are and can clean them up on demand
 - **Backup** — one click writes a zip of the whole database to the server and
   downloads a copy through the browser. Your video files are never touched
 
@@ -188,9 +219,10 @@ Everything above is configured from the cogwheel in the top bar:
 | Section | What's there |
 |---------|--------------|
 | **General** | Theme, autoplay toggle, library backup |
-| **Media Management** | Rescan (incremental or full), duplicate detection, and a reset that clears the Watched flag from every video |
+| **Media Management** | Rescan (incremental or full), duplicate detection, thumbnail cache cleanup, and a reset that clears the Watched flag from every video |
 | **Tag Management** | Filename tag settings (delimiter, title stripping, auto-tagging), then *Manage Tags* to add, rename and delete tags library-wide |
 | **AI Analysis** | Endpoint, model, API key, prompt, frame sampling, and batch runs |
+| **Statistics** | Library totals, watch progress, quality breakdown, most played, viewing habits, records and more |
 | **About** | Version, licensing, contact details, and a manual update check |
 
 ---
@@ -349,6 +381,61 @@ certificate — if you expose it to the internet.
 
 ---
 
+## Filtering by tags
+
+**Tags → Filter by tags** turns the tag list into a query. Each tag is a chip
+with three states, and clicking cycles through them:
+
+| State | Sign | Meaning |
+|-------|------|---------|
+| neutral | | the tag is not part of the filter |
+| included | `+` | the video must carry it |
+| excluded | `−` | the video must not carry it |
+
+Included tags are combined by the **Match any / Match all** button, which
+appears once two of them are selected. Exclusion is never a vote — one banned
+tag drops a video regardless of how many included ones it has.
+
+So the two shapes you'd reach for most often are:
+
+- *everything tagged tag1, tag3 or tag4* — include all three, leave it on
+  **Match any**
+- *everything tagged tag3, except anything tagged tag1 or tag5* — include tag3,
+  then click tag1 and tag5 twice each
+
+The filter lives in the URL, so a result set can be bookmarked, shared, and
+reached again with the browser's Back button. Sorting, the thumbnail/list
+toggle, pagination and select mode all work on the results, which makes the
+page a reasonable worklist for retagging as well as for browsing.
+
+Two buttons sit with the filter itself:
+
+- **Play as channel** starts an unsaved channel from exactly the videos on
+  screen — nothing is stored, and the rotation is keyed to the rule, so
+  different filters never share a "already played" list
+- **Save as channel…** opens the channel builder with the filter already loaded
+
+The topbar search box is a separate filter with the same chips; the two are kept
+apart deliberately, so typing in the search box doesn't wipe out a filter you
+were building on the Tags page.
+
+### Channels from a tag rule
+
+The channel builder takes the same include/exclude chips, plus folders. A video
+is in the channel when it is in one of the chosen folders **or** matches the
+included tags, and then only if it carries none of the excluded ones. A live
+count under the chips shows how many videos the rule currently matches, so an
+empty channel is obvious before you save it rather than after you press play.
+
+Including and excluding the same tag is rejected rather than saved, since the
+result could only ever be empty.
+
+Saved channels can be edited from the pencil on their sidebar entry. Changing a
+channel's rule clears its rotation, because the old "already played" list
+describes a channel that no longer exists.
+
+---
+
 ## Tags and filenames
 
 LocalChannels can read tags out of your filenames and write them back, so your
@@ -383,6 +470,38 @@ disk so each carries its current tags. Worth knowing before you run it:
   resume points all survive.
 
 This needs the library mounted read/write.
+
+---
+
+## Ignoring duplicate groups
+
+Not every duplicate is a mistake. Two rips of the same concert with different
+audio tracks will match on runtime forever, and both are worth keeping.
+**Ignore group** on any group in *Settings → Duplicates* dismisses it, and a
+**Show ignored (N)** toggle in the toolbar brings the dismissed ones back into
+view (dimmed, with a **Stop ignoring** button) whenever you want to revisit a
+decision.
+
+What makes this more than a mute button is what gets stored. An ignore records
+the exact set of videos that were in the group at the time, not a fingerprint of
+the match. A freshly-found group stays hidden while its members are a *subset*
+of a set you already dismissed, which gives two behaviours from one rule:
+
+- **Delete one of three ignored copies** and the remaining two are still covered
+  by the record, so you aren't asked again about a decision you already made
+- **A fourth copy appears** and the group is no longer a subset of anything, so
+  it comes back for review. Dismiss it again and the new, larger record replaces
+  the old one rather than stacking on top of it
+
+Because the ignore is a set of videos rather than a property of the match, it
+carries across detection methods: a group dismissed under *Same length* is also
+hidden under *Identical files*, as long as the members are the same files. A
+wider match that pulls in extra videos is a different set, so it is shown.
+
+Ignores are stored in the database and travel with your backups. Deleting a
+video removes it from every ignore it was part of, and an ignore that drops
+below two members is discarded, so a record can never point at files that have
+left the library.
 
 ---
 
@@ -438,6 +557,29 @@ Summaries appear on the video page between the player and the metadata table.
 Switching providers later is just a change of endpoint, model and key — the
 request format is plain OpenAI chat completions with base64 image parts, so
 anything speaking that protocol works.
+
+---
+
+### When the connection test fails
+
+**Test connection** now reports what actually went wrong, in the settings page
+itself. The three answers worth knowing:
+
+| Message | What it means |
+|---------|---------------|
+| `… returned HTTP 502/503/504` | A proxy in front of the model server answered, not the model. The server is down, restarting, or the proxy's read timeout is shorter than the model takes to reply |
+| `No response from … within 45s` | The endpoint accepted the connection and then went quiet — usually a model still loading, or one swapped to CPU |
+| `The model used its whole token budget on reasoning…` | A reasoning model (Qwen3 and similar) thought until it ran out of tokens and never answered |
+
+For the last one, turn on **Skip reasoning tokens**. It sends
+`chat_template_kwargs: {"enable_thinking": false}`, which vLLM passes to the
+chat template. It is off by default because a server that doesn't recognise the
+field rejects the whole request — the OpenAI API among them. Any `<think>`
+block that does come back is stripped from the stored summary either way.
+
+Reasoning also explains slowness rather than failure: every summary pays for
+hundreds of thinking tokens before the first useful word, which is why a smaller
+non-reasoning model can be dramatically faster on the same hardware.
 
 ---
 

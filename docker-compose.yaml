@@ -1,8 +1,8 @@
 services:
   localchannels:
-    build: .
+    # build: .
     # Or, if you'd rather pull/tag a prebuilt image instead of building:
-    # image: localchannels:latest
+    image: ghcr.io/moonpudding/localchannels:latest
     container_name: localchannels
     ports:
       - "8000:8000"
