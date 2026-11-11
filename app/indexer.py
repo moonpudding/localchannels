@@ -11,6 +11,7 @@ import json
 import os
 import re
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -21,6 +22,7 @@ from . import db
 # Simple module-level progress that the API can poll.
 STATUS = {"running": False, "done": 0, "total": 0, "current": "",
           "finished_at": 0.0, "last": None}   # "last" = summary of the most recent scan
+_LOCK = threading.Lock()
 
 # Bracket styles that can delimit the tag section of a filename.
 FILENAME_TAG_BRACKETS = {
@@ -139,7 +141,11 @@ def probe(path: Path) -> Optional[dict]:
 
     fmt = data.get("format", {})
     streams = data.get("streams", [])
-    vstream = next((s for s in streams if s.get("codec_type") == "video"), None)
+    vstream = next(
+        (s for s in streams if s.get("codec_type") == "video"
+         and not (s.get("disposition") or {}).get("attached_pic")),
+        next((s for s in streams if s.get("codec_type") == "video"), None),
+    )
     astream = next((s for s in streams if s.get("codec_type") == "audio"), None)
 
     duration = fmt.get("duration")
@@ -325,7 +331,7 @@ def move_thumbnail(old_rel: str, new_rel: str, stored: Optional[str]) -> Optiona
         return src_name
 
 
-def _detect_moves(conn, entries: list, known: dict) -> int:
+def _detect_moves(entries: list, known: dict) -> int:
     """Reattach indexed videos whose files were renamed or moved.
 
     A file that disappears from one path and reappears at another is the same
@@ -355,7 +361,7 @@ def _detect_moves(conn, entries: list, known: dict) -> int:
     if not by_hash:
         return 0
 
-    moved = 0
+    pending_moves = []
     for path, rel, stat in fresh:
         # Size is baked into the fingerprint, so this prefilter avoids hashing
         # genuinely new files in the common case.
@@ -372,28 +378,56 @@ def _detect_moves(conn, entries: list, known: dict) -> int:
             del by_hash[qh]
 
         thumb = move_thumbnail(old_rel, rel, info["thumbnail"])
-        db.move_video(conn, info["id"], rel, path.name, thumb)
+        pending_moves.append((info["id"], rel, path.name, thumb))
         # Let the main loop treat this as a known file: an untouched mtime then
         # means no re-probe and no thumbnail rebuild.
         known[rel] = {**info, "quick_hash": qh}
         known.pop(old_rel, None)
-        moved += 1
-    return moved
+
+    if pending_moves:
+        with db.get_db() as conn:
+            for vid, rel, name, thumb in pending_moves:
+                db.move_video(conn, vid, rel, name, thumb)
+    return len(pending_moves)
 
 
-def reindex(force: bool = False) -> dict:
-    """Walk the library and update the database. Returns a summary."""
-    STATUS.update(running=True, done=0, total=0, current="Scanning...", finished_at=0.0)
-    root = config.root_path
-    files = list(_iter_videos())
-    STATUS["total"] = len(files)
+def start_reindex(force: bool = False) -> bool:
+    """Start a background reindex if none is running. Returns True if started."""
+    with _LOCK:
+        if STATUS["running"]:
+            return False
+        STATUS.update(running=True, done=0, total=0, current="Scanning...", finished_at=0.0)
+    threading.Thread(
+        target=reindex, kwargs={"force": force, "_claimed": True}, daemon=True
+    ).start()
+    return True
 
-    added = updated = skipped = 0
-    with db.get_db() as conn:
-        known = db.index_snapshot(conn)
-        ignored = db.ignored_set(conn)
-        auto_tags = db.get_setting(conn, "filename_tags_auto", "0") == "1"
-        bracket_kind = db.get_setting(conn, "filename_tag_brackets", "square")
+
+def reindex(force: bool = False, _claimed: bool = False) -> dict:
+    """Walk the library and update the database. Returns a summary.
+
+    Filesystem probing, thumbnail generation and hashing run outside DB
+    transactions so concurrent API writes (playback progress, favorites, tags)
+    never block on a long-running scan.
+    """
+    if not _claimed:
+        with _LOCK:
+            if STATUS["running"]:
+                return STATUS.get("last") or {}
+            STATUS.update(running=True, done=0, total=0, current="Scanning...", finished_at=0.0)
+
+    summary = None
+    try:
+        root = config.root_path
+        files = list(_iter_videos())
+        STATUS["total"] = len(files)
+
+        added = updated = skipped = 0
+        with db.get_db() as conn:
+            known = db.index_snapshot(conn)
+            ignored = db.ignored_set(conn)
+            auto_tags = db.get_setting(conn, "filename_tags_auto", "0") == "1"
+            bracket_kind = str(db.get_setting(conn, "filename_tag_brackets", "square") or "square")
 
         # Stat everything up front; cheap, and move detection needs the full
         # picture of what is present before deciding what is genuinely new.
@@ -412,9 +446,10 @@ def reindex(force: bool = False) -> dict:
             entries.append((path, rel, stat))
 
         STATUS["current"] = "Checking for renamed or moved files..."
-        moved = _detect_moves(conn, entries, known)
+        moved = _detect_moves(entries, known)
 
         present_rel = []
+        missing_hashes: list[tuple[int, str]] = []
         for path, rel, stat in entries:
             present_rel.append(rel)
             STATUS["current"] = rel
@@ -426,15 +461,23 @@ def reindex(force: bool = False) -> dict:
                 if not info["quick_hash"]:
                     qh = quick_hash(path, stat.st_size)
                     if qh:
-                        db.set_quick_hash(conn, info["id"], qh)
+                        missing_hashes.append((info["id"], qh))
+                        if len(missing_hashes) >= 50:
+                            with db.get_db() as conn:
+                                for vid, hval in missing_hashes:
+                                    db.set_quick_hash(conn, vid, hval)
+                            missing_hashes.clear()
                 skipped += 1
                 STATUS["done"] += 1
                 continue
 
+            # Run expensive subprocesses and disk reads outside any DB transaction.
             meta = probe(path) or {}
             thumb = make_thumbnail(path, rel, meta.get("duration"))
+            qh = quick_hash(path, stat.st_size)
             folder = str(Path(rel).parent)
             folder = "" if folder == "." else folder
+            now = time.time()
             row = {
                 "rel_path": rel,
                 "folder": folder,
@@ -449,31 +492,38 @@ def reindex(force: bool = False) -> dict:
                 "bitrate": meta.get("bitrate"),
                 "container": meta.get("container"),
                 "thumbnail": thumb,
-                "quick_hash": quick_hash(path, stat.st_size),
+                "quick_hash": qh,
                 "mtime": mtime,
-                "indexed_at": time.time(),
-                "added_at": time.time(),  # only applied on first insert
+                "indexed_at": now,
+                "added_at": now,  # only applied on first insert
             }
-            db.upsert_video(conn, row)
-            vrow = db.video_by_rel(conn, rel)
-            if vrow:
-                if auto_tags:
-                    for t in extract_filename_tags(path.name, bracket_kind):
-                        db.add_tag(conn, vrow["id"], t)
-                if not vrow["vr_manual"]:
-                    vr = detect_vr(path.name)
-                    if vr:
-                        db.set_vr(conn, vrow["id"], True, vr["projection"], vr["layout"])
-                    elif vrow["vr"]:
-                        db.set_vr(conn, vrow["id"], False, None, None)
+            with db.get_db() as conn:
+                db.upsert_video(conn, row)
+                vrow = db.video_by_rel(conn, rel)
+                if vrow:
+                    if auto_tags:
+                        for t in extract_filename_tags(path.name, bracket_kind):
+                            db.add_tag(conn, vrow["id"], t)
+                    if not vrow["vr_manual"]:
+                        vr = detect_vr(path.name)
+                        if vr:
+                            db.set_vr(conn, vrow["id"], True, vr["projection"], vr["layout"])
+                        elif vrow["vr"]:
+                            db.set_vr(conn, vrow["id"], False, None, None)
             if info:
                 updated += 1
             else:
                 added += 1
             STATUS["done"] += 1
 
+        if missing_hashes:
+            with db.get_db() as conn:
+                for vid, hval in missing_hashes:
+                    db.set_quick_hash(conn, vid, hval)
+
         STATUS["current"] = "Pruning removed files..."
-        gone_thumbs = db.delete_missing(conn, present_rel)
+        with db.get_db() as conn:
+            gone_thumbs = db.delete_missing(conn, present_rel)
         for name in gone_thumbs:
             remove_thumbnail(name)
         removed = len(gone_thumbs)
@@ -482,16 +532,24 @@ def reindex(force: bool = False) -> dict:
         # an older version that never cleaned up), so sweep the directory once
         # the row set is final. One listdir; cheap next to the probing above.
         STATUS["current"] = "Cleaning up thumbnails..."
-        thumbs_removed = cleanup_thumbnails(conn)["removed"]
+        with db.get_db() as conn:
+            thumbs_removed = cleanup_thumbnails(conn)["removed"]
 
-    summary = {
-        "added": added,
-        "updated": updated,
-        "moved": moved,
-        "skipped": skipped,
-        "removed": removed,
-        "thumbs_removed": thumbs_removed,
-        "total": len(files),
-    }
-    STATUS.update(running=False, current="", finished_at=time.time(), last=summary)
-    return summary
+        summary = {
+            "added": added,
+            "updated": updated,
+            "moved": moved,
+            "skipped": skipped,
+            "removed": removed,
+            "thumbs_removed": thumbs_removed,
+            "total": len(files),
+        }
+        return summary
+    finally:
+        with _LOCK:
+            STATUS.update(
+                running=False,
+                current="",
+                finished_at=time.time(),
+                last=summary if summary is not None else STATUS.get("last"),
+            )

@@ -29,7 +29,7 @@ from fastapi.responses import (
 from fastapi.staticfiles import StaticFiles
 
 from .config import config
-from . import about, ai, backup, compat, db, indexer, report
+from . import about, ai, auth, backup, compat, db, folderart, indexer, report
 
 @asynccontextmanager
 async def _lifespan(app: "FastAPI"):
@@ -75,27 +75,21 @@ ASSET_VERSION = _asset_version()
 
 # ---------------------------------------------------------------------------
 # Simple shared-password protection (optional, off by default)
+#
+# Enable/disable, the password and how long a sign-in lasts are all set in
+# Settings → General and stored in the database; see auth.py.
 # ---------------------------------------------------------------------------
-AUTH_ENABLED = bool(config.auth_enabled) and bool(config.password)
-if config.auth_enabled and not config.password:
-    print("[localchannels] AUTH is enabled but no password is set — auth "
-          "disabled. Set LOCALCHANNELS_PASSWORD to protect the site.")
+auth.init()
 
-# Session cookie value derived from the password: stable across restarts, and
-# doesn't expose the password itself.
-_AUTH_TOKEN = hashlib.sha256(
-    ("localchannels-session::" + str(config.password)).encode("utf-8")
-).hexdigest()
-COOKIE_NAME = "vt_session"
 PUBLIC_PATHS = {"/login", "/api/login", "/api/logout", "/api/health"}
 
 
 @app.middleware("http")
 async def auth_guard(request: Request, call_next):
-    if not AUTH_ENABLED:
+    if not auth.enabled():
         return await call_next(request)
     path = request.url.path
-    if path in PUBLIC_PATHS or request.cookies.get(COOKIE_NAME) == _AUTH_TOKEN:
+    if path in PUBLIC_PATHS or auth.valid_session(request.cookies.get(auth.COOKIE_NAME)):
         return await call_next(request)
     if path.startswith("/api/"):
         return JSONResponse({"detail": "Unauthorized"}, status_code=401)
@@ -109,14 +103,11 @@ def api_health():
 
 @app.post("/api/login")
 def api_login(payload: dict = Body(...)):
-    if not AUTH_ENABLED:
+    if not auth.enabled():
         return {"ok": True}
-    if str(payload.get("password", "")) == str(config.password):
+    if auth.check_password(str(payload.get("password", ""))):
         resp = JSONResponse({"ok": True})
-        resp.set_cookie(
-            COOKIE_NAME, _AUTH_TOKEN, httponly=True, samesite="lax",
-            max_age=60 * 60 * 24 * 30, path="/",
-        )
+        auth.set_cookie(resp)
         return resp
     return JSONResponse({"detail": "Incorrect password"}, status_code=401)
 
@@ -124,7 +115,42 @@ def api_login(payload: dict = Body(...)):
 @app.post("/api/logout")
 def api_logout():
     resp = JSONResponse({"ok": True})
-    resp.delete_cookie(COOKIE_NAME, path="/")
+    auth.clear_cookie(resp)
+    return resp
+
+
+@app.get("/api/auth")
+def api_auth_status():
+    return auth.status()
+
+
+@app.post("/api/auth")
+def api_auth_update(payload: dict = Body(...)):
+    """Change any of: enabled, password, session_days."""
+    enabled = payload.get("enabled")
+    password = payload.get("password")
+    days = payload.get("session_days")
+    if enabled is not None and not isinstance(enabled, bool):
+        raise HTTPException(400, "enabled must be true or false")
+    if password is not None and not isinstance(password, str):
+        raise HTTPException(400, "password must be text")
+    if days is not None:
+        try:
+            days = int(days)
+        except (TypeError, ValueError):
+            raise HTTPException(400, "session_days must be a number")
+    try:
+        status = auth.update(enabled=enabled, password=password, session_days=days)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    resp = JSONResponse({"ok": True, **status})
+    # Keep the browser that made the change signed in: turning protection on
+    # would otherwise bounce it to the login page, and a new password
+    # invalidates every existing session, this one included.
+    if status["enabled"]:
+        auth.set_cookie(resp)
+    else:
+        auth.clear_cookie(resp)
     return resp
 
 
@@ -183,7 +209,7 @@ LOGIN_HTML = """<!DOCTYPE html>
 
 @app.get("/login")
 def login_page():
-    if not AUTH_ENABLED:
+    if not auth.enabled():
         return RedirectResponse("/")
     return HTMLResponse(
         LOGIN_HTML.replace("__SITE__", config.site_name),
@@ -195,7 +221,7 @@ def _maybe_initial_index():
     with db.get_db() as conn:
         count = conn.execute("SELECT COUNT(*) AS c FROM videos").fetchone()["c"]
     if count == 0 and config.root_path.exists():
-        threading.Thread(target=indexer.reindex, daemon=True).start()
+        indexer.start_reindex()
 
 
 # ---------------------------------------------------------------------------
@@ -211,7 +237,7 @@ def _title_config(conn) -> tuple[bool, str]:
     if _TITLE_CFG["value"] is None:
         _TITLE_CFG["value"] = (
             db.get_setting(conn, "filename_tags_strip_title", "1") == "1",
-            db.get_setting(conn, "filename_tag_brackets", "square"),
+            str(db.get_setting(conn, "filename_tag_brackets", "square") or "square"),
         )
     return _TITLE_CFG["value"]
 
@@ -224,9 +250,20 @@ def display_title(conn, filename: str) -> str:
     return indexer.strip_filename_tags(stem, kind) if strip else stem
 
 
-def serialize_video(conn, row, include_detail: bool = False) -> dict:
+def serialize_video(
+    conn,
+    row,
+    include_detail: bool = False,
+    stats: Optional[dict[int, tuple[int, Optional[float]]]] = None,
+) -> dict:
+    vid = row["id"]
+    if stats is not None:
+        p_count, l_played = stats.get(vid, (0, None))
+    else:
+        l_played = db.last_played(conn, vid)
+        p_count = db.play_count(conn, vid)
     d = {
-        "id": row["id"],
+        "id": vid,
         "rel_path": row["rel_path"],
         "folder": row["folder"],
         "filename": row["filename"],
@@ -249,16 +286,24 @@ def serialize_video(conn, row, include_detail: bool = False) -> dict:
         "vr": bool(row["vr"]),
         "vr_projection": row["vr_projection"] or "eq180",
         "vr_layout": row["vr_layout"] or "mono",
-        "last_played": db.last_played(conn, row["id"]),
-        "play_count": db.play_count(conn, row["id"]),
+        "last_played": l_played,
+        "play_count": p_count,
     }
     if include_detail:
-        d["tags"] = db.tags_for_video(conn, row["id"])
+        d["tags"] = db.tags_for_video(conn, vid)
         d["indexed_at"] = row["indexed_at"]
         d["ai_summary"] = row["ai_summary"]
         d["ai_summary_at"] = row["ai_summary_at"]
         d["ai_model"] = row["ai_model"]
     return d
+
+
+def serialize_videos(conn, rows) -> list[dict]:
+    """Serialize a list of video rows using a single bulk play-stats query."""
+    if not rows:
+        return []
+    stats = db.play_stats_map(conn, [r["id"] for r in rows])
+    return [serialize_video(conn, r, stats=stats) for r in rows]
 
 
 # ---------------------------------------------------------------------------
@@ -267,7 +312,7 @@ def serialize_video(conn, row, include_detail: bool = False) -> dict:
 
 @app.get("/api/config")
 def api_config():
-    return config.public()
+    return {**config.public(), "auth_enabled": auth.enabled()}
 
 
 # Server-side settings the UI can change, with their defaults.
@@ -278,13 +323,16 @@ SETTING_DEFAULTS = {
     "backup_include_thumbs": "0",        # "1" to put cached thumbnails in backups
     "channel_order": "random",           # random | sequential (by filename)
     "warn_unwritten_tags": "1",          # "1" to flag tags not yet in filenames
+    "folder_backdrops": "1",             # "1" to use backdrop.jpg/png as the page background
+    "folder_backdrop_dim": "60",         # 0–90: how far the backdrop fades into the theme, in %
+    "folder_backdrop_blur": "6",         # 0–40: blur radius in px
     **ai.AI_SETTING_DEFAULTS,            # ai_endpoint, ai_model, ai_frame_mode, ...
 }
 
 # Settings stored as "0"/"1"; anything truthy-looking is normalised on save.
 _BOOL_SETTINGS = {"filename_tags_auto", "filename_tags_strip_title",
                   "backup_include_thumbs", "warn_unwritten_tags",
-                  "ai_disable_thinking"}
+                  "ai_disable_thinking", "folder_backdrops"}
 
 # Saving any of these changes how titles are derived, so drop the cache.
 _TITLE_SETTINGS = {"filename_tags_strip_title", "filename_tag_brackets"}
@@ -297,12 +345,24 @@ _AI_NUMERIC_BOUNDS = {
     "ai_frame_width": (64, 4096),
 }
 
+# Every numeric setting, AI or not, validated the same way on save.
+_NUMERIC_BOUNDS = {
+    **_AI_NUMERIC_BOUNDS,
+    "folder_backdrop_dim": (0, 90),
+    "folder_backdrop_blur": (0, 40),
+}
+
 
 @app.get("/api/settings")
 def api_get_settings():
     with db.get_db() as conn:
         stored = db.all_settings(conn)
-    return {**SETTING_DEFAULTS, **stored}
+    # The password hash and session secret share the table; they have their
+    # own endpoint (/api/auth) and must never be handed to the browser.
+    stored = {k: v for k, v in stored.items() if not k.startswith("auth_")}
+    out = {**SETTING_DEFAULTS, **stored}
+    out["ai_thinking"] = ai.thinking_mode(stored)
+    return out
 
 
 @app.post("/api/settings")
@@ -317,12 +377,24 @@ def api_set_setting(payload: dict = Body(...)):
         raise HTTPException(400, "Channel order must be 'random' or 'sequential'")
     if key in _BOOL_SETTINGS:
         value = "1" if str(value).strip().lower() in ("1", "true", "yes", "on") else "0"
+    if key == "ai_thinking":
+        v = str(value or "").strip().lower()
+        if v in ("enabled", "on", "true", "1"):
+            value = "enabled"
+        elif v in ("disabled", "off", "false", "0"):
+            value = "disabled"
+        elif v == "default":
+            value = "default"
+        else:
+            raise HTTPException(
+                400, "Thinking mode must be 'default', 'enabled' or 'disabled'"
+            )
     if key == "ai_frame_mode" and value not in ("count", "interval"):
         raise HTTPException(400, "Frame mode must be 'count' or 'interval'")
-    if key in _AI_NUMERIC_BOUNDS:
-        lo, hi = _AI_NUMERIC_BOUNDS[key]
+    if key in _NUMERIC_BOUNDS:
+        lo, hi = _NUMERIC_BOUNDS[key]
         try:
-            n = float(value)
+            n = float(str(value))
         except (TypeError, ValueError):
             raise HTTPException(400, f"{key} must be a number")
         if not (lo <= n <= hi):
@@ -330,6 +402,10 @@ def api_set_setting(payload: dict = Body(...)):
         value = str(int(n))
     with db.get_db() as conn:
         db.set_setting(conn, key, str(value))
+        if key == "ai_thinking":
+            db.set_setting(conn, "ai_disable_thinking", "1" if value == "disabled" else "0")
+        elif key == "ai_disable_thinking":
+            db.set_setting(conn, "ai_thinking", "disabled" if value == "1" else "default")
     if key in _TITLE_SETTINGS:
         _TITLE_CFG["value"] = None
     return {"ok": True, "key": key, "value": str(value)}
@@ -337,9 +413,8 @@ def api_set_setting(payload: dict = Body(...)):
 
 @app.post("/api/reindex")
 def api_reindex(force: bool = Query(False)):
-    if indexer.STATUS["running"]:
+    if not indexer.start_reindex(force=force):
         return {"status": "already_running", **indexer.STATUS}
-    threading.Thread(target=indexer.reindex, kwargs={"force": force}, daemon=True).start()
     return {"status": "started"}
 
 
@@ -462,9 +537,9 @@ def api_ai_analyze(payload: dict = Body(default={})):
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    f"SELECT id FROM videos WHERE (folder = ? OR folder LIKE ?) "
+                    f"SELECT id FROM videos WHERE (folder = ? OR folder LIKE ? ESCAPE '\\') "
                     f"{skip} ORDER BY rel_path",
-                    (folder, f"{folder}/%"),
+                    (folder, f"{db.escape_like(folder)}/%"),
                 ).fetchall()
             ids = [r["id"] for r in rows]
         else:
@@ -479,7 +554,8 @@ def api_ai_analyze(payload: dict = Body(default={})):
 
     if not ids:
         return {"status": "nothing_to_do", "queued": 0}
-    threading.Thread(target=ai.run_job, args=(ids,), daemon=True).start()
+    if not ai.start_job(ids):
+        return {"status": "already_running", **ai.STATUS}
     return {"status": "started", "queued": len(ids)}
 
 
@@ -496,9 +572,13 @@ def api_clear_ai_summary(video_id: int):
 # Maintenance: duplicate detection + file deletion
 # ---------------------------------------------------------------------------
 
-def _file_hash(conn, row) -> Optional[str]:
+def _file_hash(row) -> Optional[str]:
     """SHA-256 of the file's contents, cached in the DB and recomputed only when
-    the file's mtime changes. Returns None if the file is missing/unreadable."""
+    the file's mtime changes. Returns None if the file is missing/unreadable.
+
+    Disk reads happen outside DB transactions so hashing large files never holds
+    a SQLite write lock.
+    """
     if row["content_hash"] and row["hash_mtime"] == row["mtime"]:
         return row["content_hash"]
     path = config.root_path / row["rel_path"]
@@ -512,7 +592,8 @@ def _file_hash(conn, row) -> Optional[str]:
     except OSError:
         return None
     digest = h.hexdigest()
-    db.set_content_hash(conn, row["id"], digest, row["mtime"])
+    with db.get_db() as conn:
+        db.set_content_hash(conn, row["id"], digest, row["mtime"])
     return digest
 
 
@@ -536,7 +617,7 @@ def api_duplicates(method: str = Query("hash"),
                    tolerance_ms: int = Query(0, ge=0, le=60000)):
     """Find likely-duplicate videos.
 
-    method=hash     — byte-identical files (exact SHA-256 match; size-prefiltered)
+    method=hash     — byte-identical files (exact SHA-256 match; size+quick_hash prefiltered)
     method=size     — same exact file size
     method=duration — same runtime, compared at millisecond resolution.
                       `tolerance_ms` widens the match window (0 = exact to the
@@ -550,81 +631,94 @@ def api_duplicates(method: str = Query("hash"),
     """
     with db.get_db() as conn:
         rows = conn.execute("SELECT * FROM videos").fetchall()
-        groups: list[dict] = []
-
         ignores = db.ignored_dupe_sets(conn)
 
-        def match_ignore(ids: set[int]) -> Optional[int]:
-            """The ignore covering this group, if there is one.
+    raw_groups: list[list] = []
 
-            Subset, not equality. Delete one of three dismissed copies and the
-            remaining two are still covered, so a decision already made isn't
-            put back in front of the user. Gain a copy and nothing covers the
-            group any more, so it returns for review — which is the whole point
-            of storing the member set rather than a fingerprint of the match.
-            """
-            for gid, members in ignores.items():
-                if members and ids <= members:
-                    return gid
-            return None
+    def collect(items):
+        if len(items) >= 2:
+            raw_groups.append(items)
 
-        def emit(items):
+    if method == "size":
+        buckets: dict = {}
+        for r in rows:
+            if r["size"]:
+                buckets.setdefault(r["size"], []).append(r)
+        for items in buckets.values():
+            collect(items)
+    elif method == "duration":
+        # Walk in duration order and break a group whenever the gap to the
+        # previous video exceeds the tolerance. Avoids the bucket-boundary
+        # problem where two near-identical runtimes round into different
+        # buckets (and vice versa).
+        timed = sorted(
+            (r for r in rows if r["duration"]), key=lambda r: r["duration"]
+        )
+        run: list = []
+        prev_ms = 0
+        for r in timed:
+            ms = round(r["duration"] * 1000)
+            if run and (ms - prev_ms) > tolerance_ms:
+                collect(run)
+                run = []
+            run.append(r)
+            prev_ms = ms
+        collect(run)
+    else:  # hash — prefilter by size and quick_hash, then confirm with content hash
+        by_size: dict = {}
+        for r in rows:
+            if r["size"]:
+                by_size.setdefault(r["size"], []).append(r)
+        for items in by_size.values():
             if len(items) < 2:
-                return
-            durations = [it["duration"] for it in items if it["duration"] is not None]
-            ids = {it["id"] for it in items}
-            gid = match_ignore(ids)
-            groups.append({
-                "videos": [serialize_video(conn, it) for it in items],
-                "size": items[0]["size"],
-                "duration": items[0]["duration"],
-                "duration_min": min(durations) if durations else None,
-                "duration_max": max(durations) if durations else None,
-                "video_ids": sorted(ids),
-                "ignored": gid is not None,
-                "ignore_id": gid,
-            })
-
-        if method == "size":
-            buckets: dict = {}
-            for r in rows:
-                if r["size"]:
-                    buckets.setdefault(r["size"], []).append(r)
-            for items in buckets.values():
-                emit(items)
-        elif method == "duration":
-            # Walk in duration order and break a group whenever the gap to the
-            # previous video exceeds the tolerance. Avoids the bucket-boundary
-            # problem where two near-identical runtimes round into different
-            # buckets (and vice versa).
-            timed = sorted(
-                (r for r in rows if r["duration"]), key=lambda r: r["duration"]
-            )
-            run: list = []
-            prev_ms = 0
-            for r in timed:
-                ms = round(r["duration"] * 1000)
-                if run and (ms - prev_ms) > tolerance_ms:
-                    emit(run)
-                    run = []
-                run.append(r)
-                prev_ms = ms
-            emit(run)
-        else:  # hash — prefilter by size, then confirm with content hash
-            by_size: dict = {}
-            for r in rows:
-                if r["size"]:
-                    by_size.setdefault(r["size"], []).append(r)
-            for items in by_size.values():
-                if len(items) < 2:
+                continue
+            by_qh: dict = {}
+            for it in items:
+                qh = it["quick_hash"]
+                if not qh:
+                    qh = indexer.quick_hash(config.root_path / it["rel_path"], it["size"])
+                    if qh:
+                        with db.get_db() as conn:
+                            db.set_quick_hash(conn, it["id"], qh)
+                if qh:
+                    by_qh.setdefault(qh, []).append(it)
+            for qh_items in by_qh.values():
+                if len(qh_items) < 2:
                     continue
                 by_hash: dict = {}
-                for it in items:
-                    digest = _file_hash(conn, it)
+                for it in qh_items:
+                    digest = _file_hash(it)
                     if digest:
                         by_hash.setdefault(digest, []).append(it)
                 for dups in by_hash.values():
-                    emit(dups)
+                    collect(dups)
+
+    def match_ignore(ids: set[int]) -> Optional[int]:
+        """The ignore covering this group, if there is one."""
+        for gid, members in ignores.items():
+            if members and ids <= members:
+                return gid
+        return None
+
+    groups: list[dict] = []
+    if raw_groups:
+        all_ids = [it["id"] for grp in raw_groups for it in grp]
+        with db.get_db() as conn:
+            stats = db.play_stats_map(conn, all_ids)
+            for items in raw_groups:
+                durations = [it["duration"] for it in items if it["duration"] is not None]
+                ids = {it["id"] for it in items}
+                gid = match_ignore(ids)
+                groups.append({
+                    "videos": [serialize_video(conn, it, stats=stats) for it in items],
+                    "size": items[0]["size"],
+                    "duration": items[0]["duration"],
+                    "duration_min": min(durations) if durations else None,
+                    "duration_max": max(durations) if durations else None,
+                    "video_ids": sorted(ids),
+                    "ignored": gid is not None,
+                    "ignore_id": gid,
+                })
 
     groups.sort(key=lambda g: (g["size"] or 0) * len(g["videos"]), reverse=True)
     return {
@@ -851,31 +945,20 @@ def api_browse(
     col = _sort_column(sort)
     direction = "DESC" if str(order).lower() == "desc" else "ASC"
     with db.get_db() as conn:
-        # Subfolders: distinct folder values that are direct children of `path`.
-        rows = conn.execute("SELECT DISTINCT folder FROM videos").fetchall()
+        # Subfolders and recursive counts in a single GROUP BY query.
+        all_folders = db.folder_tree_counts(conn)
         prefix = f"{path}/" if path else ""
         subfolders: dict[str, int] = {}
-        for r in rows:
-            folder = r["folder"]
+        for folder, cnt in all_folders.items():
             if path:
-                if not folder.startswith(prefix) and folder != path:
+                if not folder.startswith(prefix):
                     continue
-                remainder = folder[len(prefix):] if folder.startswith(prefix) else ""
+                remainder = folder[len(prefix):]
             else:
                 remainder = folder
-            if remainder == "":
+            if not remainder or "/" in remainder:
                 continue
-            child = remainder.split("/")[0]
-            child_full = f"{prefix}{child}"
-            subfolders.setdefault(child_full, 0)
-
-        # Count videos under each subfolder (recursive).
-        for child_full in list(subfolders.keys()):
-            cnt = conn.execute(
-                "SELECT COUNT(*) AS c FROM videos WHERE folder = ? OR folder LIKE ?",
-                (child_full, f"{child_full}/%"),
-            ).fetchone()["c"]
-            subfolders[child_full] = cnt
+            subfolders[folder] = cnt
 
         # Videos directly in this folder, sorted per the global preference
         # (NULLs always last so missing durations/dates don't jump to the top).
@@ -884,13 +967,15 @@ def api_browse(
             f"ORDER BY ({col} IS NULL), {col} {direction}",
             (path,),
         ).fetchall()
-        videos = [serialize_video(conn, v) for v in vrows]
+        videos = serialize_videos(conn, vrows)
 
     folders = [
-        {"path": p, "name": p.split("/")[-1], "count": c}
+        {"path": p, "name": p.split("/")[-1], "count": c,
+         "image": folderart.url(p, "folder")}
         for p, c in sorted(subfolders.items())
     ]
-    return {"path": path, "folders": folders, "videos": videos}
+    return {"path": path, "folders": folders, "videos": videos,
+            "backdrop": folderart.url(path, "backdrop")}
 
 
 @app.get("/api/videos")
@@ -911,7 +996,7 @@ def api_all_videos(
             rows = conn.execute(q + " LIMIT ? OFFSET ?", (limit, offset)).fetchall()
         else:
             rows = conn.execute(q).fetchall()
-        videos = [serialize_video(conn, v) for v in rows]
+        videos = serialize_videos(conn, rows)
     return {"videos": videos, "count": total, "limit": limit, "offset": offset}
 
 
@@ -921,7 +1006,7 @@ def api_vr_videos(sort: str = Query("name"), order: str = Query("asc")):
     direction = "DESC" if str(order).lower() == "desc" else "ASC"
     with db.get_db() as conn:
         rows = db.vr_videos(conn, f"({col} IS NULL), {col} {direction}")
-        videos = [serialize_video(conn, v) for v in rows]
+        videos = serialize_videos(conn, rows)
     return {"videos": videos, "count": len(videos)}
 
 
@@ -968,23 +1053,11 @@ def api_set_vr(video_id: int, payload: dict = Body(...)):
 def api_tree():
     """Full folder tree for the sidebar."""
     with db.get_db() as conn:
-        rows = conn.execute("SELECT DISTINCT folder FROM videos").fetchall()
-    folders = set()
-    for r in rows:
-        parts = r["folder"].split("/") if r["folder"] else []
-        acc = ""
-        for part in parts:
-            acc = f"{acc}/{part}" if acc else part
-            folders.add(acc)
-    with db.get_db() as conn:
-        result = []
-        for f in sorted(folders):
-            cnt = conn.execute(
-                "SELECT COUNT(*) AS c FROM videos WHERE folder = ? OR folder LIKE ?",
-                (f, f"{f}/%"),
-            ).fetchone()["c"]
-            result.append({"path": f, "name": f.split("/")[-1],
-                           "depth": f.count("/"), "count": cnt})
+        counts = db.folder_tree_counts(conn)
+    result = [
+        {"path": f, "name": f.split("/")[-1], "depth": f.count("/"), "count": counts[f]}
+        for f in sorted(counts)
+    ]
     return {"folders": result}
 
 
@@ -1022,9 +1095,10 @@ def api_played(video_id: int):
 def api_history(limit: int = Query(100, le=500)):
     with db.get_db() as conn:
         rows = db.recent_history(conn, limit)
+        stats = db.play_stats_map(conn, [r["id"] for r in rows])
         out = []
         for r in rows:
-            v = serialize_video(conn, r)
+            v = serialize_video(conn, r, stats=stats)
             v["played_at"] = r["played_at"]
             out.append(v)
     return {"videos": out}
@@ -1044,7 +1118,7 @@ def api_set_favorite(video_id: int, payload: dict = Body(...)):
 def api_favorites():
     with db.get_db() as conn:
         rows = db.favorites(conn)
-        videos = [serialize_video(conn, r) for r in rows]
+        videos = serialize_videos(conn, rows)
     return {"videos": videos}
 
 
@@ -1081,7 +1155,7 @@ def api_progress(video_id: int, payload: dict = Body(...)):
 def api_new(limit: int = Query(100, le=500)):
     with db.get_db() as conn:
         rows = db.newest(conn, limit)
-        videos = [serialize_video(conn, r) for r in rows]
+        videos = serialize_videos(conn, rows)
     return {"videos": videos}
 
 
@@ -1184,22 +1258,31 @@ def _tag_write_problem(tag: str) -> Optional[str]:
     return None
 
 
-def _plan_tag_writes(conn) -> list[dict]:
-    """Work out the rename each tagged video would need, without touching disk.
+def _plan_tag_writes(conn, check_disk: bool = True) -> list[dict]:
+    """Work out the rename each tagged video would need, without modifying disk.
 
     Videos with no tags are left alone entirely — this writes tags out, it never
     strips a bracket section off a file the app doesn't have tags for.
+    When `check_disk=False` (used by the toolbar poll `/api/tags/pending`),
+    collisions are checked against the indexed library paths in memory so the
+    poll never touches the filesystem.
     """
-    kind = db.get_setting(conn, "filename_tag_brackets", "square")
+    kind = str(db.get_setting(conn, "filename_tag_brackets", "square") or "square")
     open_c, close_c = indexer.FILENAME_TAG_BRACKETS.get(
         kind, indexer.FILENAME_TAG_BRACKETS["square"]
     )
-    rows = conn.execute("SELECT * FROM videos ORDER BY rel_path").fetchall()
+    tags_by_vid = db.video_tags_map(conn)
+    if not tags_by_vid:
+        return []
+    rows = conn.execute(
+        "SELECT id, rel_path, folder, filename FROM videos ORDER BY rel_path"
+    ).fetchall()
+    indexed_paths = {r["rel_path"] for r in rows}
 
     plan: list[dict] = []
     claimed: dict[str, int] = {}       # target rel_path -> video id that wants it
     for r in rows:
-        tags = db.tags_for_video(conn, r["id"])
+        tags = tags_by_vid.get(r["id"])
         if not tags:
             continue
 
@@ -1218,12 +1301,19 @@ def _plan_tag_writes(conn) -> list[dict]:
         new_rel = f"{r['folder']}/{new_name}" if r["folder"] else new_name
         item["to"] = new_rel
 
-        if new_name == r["filename"]:
+        existing_tags = indexer.extract_filename_tags(r["filename"], kind)
+        already_has_tags = (
+            new_name == r["filename"]
+            or (set(existing_tags) == set(tags)
+                and f"{base} {open_c}{' '.join(existing_tags)}{close_c}{ext}" == r["filename"])
+        )
+
+        if already_has_tags:
             item.update(status="unchanged")
         elif new_rel in claimed:
             item.update(status="skipped",
                         reason="another video would be renamed to this same name")
-        elif (config.root_path / new_rel).exists():
+        elif new_rel in indexed_paths or (check_disk and (config.root_path / new_rel).exists()):
             item.update(status="skipped", reason="a file with that name already exists")
         else:
             claimed[new_rel] = r["id"]
@@ -1255,12 +1345,12 @@ def api_tags_pending():
 
     Cheap counterpart to /api/tags/to-filenames: the UI polls this to decide
     whether to show the unwritten-tags warning, so it returns counts only and
-    never touches disk beyond the existence checks the plan already does.
+    never touches disk.
     """
     with db.get_db() as conn:
         if db.get_setting(conn, "warn_unwritten_tags", "1") != "1":
             return {"enabled": False, "pending": 0, "skipped": 0}
-        summary = _plan_summary(_plan_tag_writes(conn))
+        summary = _plan_summary(_plan_tag_writes(conn, check_disk=False))
     return {"enabled": True, "pending": summary["rename"], "skipped": summary["skipped"]}
 
 
@@ -1359,7 +1449,7 @@ def api_untagged(sort: str = Query("name"), order: str = Query("asc")):
     direction = "DESC" if str(order).lower() == "desc" else "ASC"
     with db.get_db() as conn:
         rows = db.untagged_videos(conn, f"{col} {direction}")
-        videos = [serialize_video(conn, r) for r in rows]
+        videos = serialize_videos(conn, rows)
     return {"videos": videos, "total": len(videos)}
 
 
@@ -1408,7 +1498,7 @@ def api_search(
             offset=offset,
             **filters,
         )
-        videos = [serialize_video(conn, r) for r in rows]
+        videos = serialize_videos(conn, rows)
         out = {"videos": videos, "total": total, "count": len(videos)}
         if facets:
             # Tags that co-occur with the current filter, counted over every
@@ -1421,7 +1511,7 @@ def api_search(
 def api_tag_videos(name: str):
     with db.get_db() as conn:
         rows = db.videos_for_tag(conn, name)
-        videos = [serialize_video(conn, r) for r in rows]
+        videos = serialize_videos(conn, rows)
     return {"tag": name, "videos": videos}
 
 
@@ -1475,8 +1565,8 @@ def _pool(conn, folders: list[str], tags: list[str],
         if real_folders:
             subs = []
             for f in real_folders:
-                subs.append("(folder = ? OR folder LIKE ?)")
-                params.extend([f, f"{f}/%"])
+                subs.append("(folder = ? OR folder LIKE ? ESCAPE '\\')")
+                params.extend([f, f"{db.escape_like(f)}/%"])
             clauses.append("(" + " OR ".join(subs) + ")")
         if tags:
             ph = ", ".join("?" for _ in tags)
@@ -1672,8 +1762,8 @@ def api_channels_preview(payload: dict = Body(default={})):
     mode = "all" if payload.get("tag_mode") == "all" else "any"
     with db.get_db() as conn:
         pool = _pool(conn, folders, tags, exclude, mode)
-        sample = [serialize_video(conn, db.get_video(conn, vid))
-                  for vid in pool[:12]]
+        rows = [r for vid in pool[:12] if (r := db.get_video(conn, vid)) is not None]
+        sample = serialize_videos(conn, rows)
     return {"count": len(pool), "sample": sample}
 
 
@@ -1724,13 +1814,36 @@ def api_thumb(video_id: int):
     return FileResponse(thumb, media_type="image/jpeg")
 
 
+@app.get("/api/folder-image")
+def api_folder_image(
+    path: str = Query("", description="folder relative to root"),
+    kind: str = Query("folder"),
+    v: str = Query("", description="cache-busting version from /api/browse"),
+):
+    """folder.jpg/png (downscaled for the library tiles) or backdrop.jpg/png."""
+    if kind not in folderart.ART_NAMES:
+        raise HTTPException(400, "Unknown image kind")
+    src = folderart.find(path).get(kind)
+    if src is None:
+        raise HTTPException(404, "No image")
+    out = folderart.tile_image(src) if kind == "folder" else src
+    # A URL carrying the version changes whenever the file does, so it can be
+    # cached for good; a bare one has to be revalidated.
+    cache = "private, max-age=31536000, immutable" if v else "no-cache"
+    return FileResponse(
+        out,
+        media_type=folderart.MEDIA_TYPES.get(out.suffix.lower(), "application/octet-stream"),
+        headers={"Cache-Control": cache},
+    )
+
+
 RANGE_RE = re.compile(r"bytes=(\d*)-(\d*)")
 
 
 def _safe_media_path(rel_path: str) -> Path:
     # Prevent path traversal: resolved file must stay inside root_path.
     candidate = (config.root_path / rel_path).resolve()
-    if not str(candidate).startswith(str(config.root_path)):
+    if not candidate.is_relative_to(config.root_path.resolve()):
         raise HTTPException(403, "Forbidden")
     if not candidate.exists() or not candidate.is_file():
         raise HTTPException(404, "File not found")

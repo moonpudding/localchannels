@@ -24,7 +24,8 @@ DEFAULTS = {
     "thumbnail_width": 480,
     # Fraction of the video's duration at which the poster frame is grabbed.
     "thumbnail_seek_fraction": 0.20,
-    # Simple shared-password protection (off by default).
+    # Shared-password protection. These two only seed the first run: once a
+    # password exists it is managed in Settings → General (see auth.py).
     "auth_enabled": False,
     "password": "",
     "video_extensions": [
@@ -65,7 +66,6 @@ class Config:
             "site_name": self._data["site_name"],
             "default_theme": self._data["default_theme"],
             "root_path": str(self.root_path),
-            "auth_enabled": bool(self._data["auth_enabled"]),
         }
 
 

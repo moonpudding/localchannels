@@ -42,7 +42,8 @@ AI_SETTING_DEFAULTS = {
     "ai_frame_interval": "60",                   # seconds between frames (interval mode)
     "ai_max_frames": "16",                       # hard cap either way
     "ai_frame_width": "512",                     # frames are downscaled to this width
-    "ai_disable_thinking": "0",                  # ask the server to skip reasoning tokens
+    "ai_thinking": "default",                    # default | enabled | disabled
+    "ai_disable_thinking": "0",                  # legacy boolean alias for disabled
 }
 
 REQUEST_TIMEOUT = 600  # seconds for one analysis call — VLMs can be slow
@@ -79,15 +80,30 @@ STATUS = {
     "finished_at": 0.0,
 }
 _CANCEL = threading.Event()
+_LOCK = threading.Lock()
 
 
 class AIError(Exception):
     """Raised when analysis of a single video fails."""
 
 
+def thinking_mode(settings: dict) -> str:
+    """Resolve effective thinking mode: 'enabled', 'disabled', or 'default'."""
+    raw = str(settings.get("ai_thinking") or "").strip().lower()
+    if raw in ("enabled", "on", "true", "1"):
+        return "enabled"
+    if raw in ("disabled", "off", "false", "0"):
+        return "disabled"
+    if str(settings.get("ai_disable_thinking", "0")) == "1":
+        return "disabled"
+    return "default"
+
+
 def get_ai_settings(conn) -> dict:
     stored = db.all_settings(conn)
-    return {k: stored.get(k, v) for k, v in AI_SETTING_DEFAULTS.items()}
+    out = {k: stored.get(k, v) for k, v in AI_SETTING_DEFAULTS.items()}
+    out["ai_thinking"] = thinking_mode(stored)
+    return out
 
 
 def _num(value, default: float, minimum: float) -> float:
@@ -161,17 +177,23 @@ def _post_chat(settings: dict, messages: list, max_tokens: int = 1024,
     """POST to /chat/completions and return the assistant message content."""
     url = chat_url(settings.get("ai_endpoint", ""))
     timeout = timeout or REQUEST_TIMEOUT
+    t_mode = thinking_mode(settings)
+    if t_mode == "enabled" and max_tokens < 4096:
+        max_tokens = 4096
     payload = {
         "model": settings.get("ai_model") or "default",
         "messages": messages,
         "max_tokens": max_tokens,
         "temperature": 0.2,
     }
-    # vLLM passes this through to the chat template; it is what turns off Qwen3
-    # style thinking. Off by default because a server that doesn't know the
-    # field (OpenAI itself, for one) rejects the whole request.
-    if str(settings.get("ai_disable_thinking", "0")) == "1":
+    # vLLM and compatible local servers pass chat_template_kwargs through to the
+    # model's chat template to toggle Qwen3/reasoning thinking on or off.
+    # Omitted in "default" mode because strict servers (OpenAI API) reject
+    # unknown top-level fields.
+    if t_mode == "disabled":
         payload["chat_template_kwargs"] = {"enable_thinking": False}
+    elif t_mode == "enabled":
+        payload["chat_template_kwargs"] = {"enable_thinking": True}
     headers = {"Content-Type": "application/json"}
     api_key = (settings.get("ai_api_key") or "").strip()
     if api_key:
@@ -229,8 +251,8 @@ def _post_chat(settings: dict, messages: list, max_tokens: int = 1024,
         if finish == "length" or reasoned:
             raise AIError(
                 f"The model used its whole {max_tokens}-token budget on "
-                "reasoning and never produced an answer. Turn on \u201cSkip "
-                "reasoning tokens\u201d below, or use a non-reasoning model."
+                "reasoning and never produced an answer. Set \u201cThinking\u201d "
+                "to Disabled below, or use a non-reasoning model."
             )
         raise AIError("Model returned an empty response")
     return content
@@ -300,14 +322,34 @@ def cancel_job() -> None:
     _CANCEL.set()
 
 
-def run_job(video_ids: list[int]) -> None:
+def start_job(video_ids: list[int]) -> bool:
+    """Start a background analysis job if none is running. Returns True if started."""
+    with _LOCK:
+        if STATUS["running"]:
+            return False
+        STATUS.update(
+            running=True, done=0, total=len(video_ids), current="",
+            current_video_id=None, errors=0, last_error="", finished_at=0.0,
+        )
+        _CANCEL.clear()
+    threading.Thread(
+        target=run_job, args=(video_ids,), kwargs={"_claimed": True}, daemon=True
+    ).start()
+    return True
+
+
+def run_job(video_ids: list[int], _claimed: bool = False) -> None:
     """Analyse a list of videos sequentially, updating STATUS as it goes.
     Settings are snapshotted once at the start of the job."""
-    STATUS.update(
-        running=True, done=0, total=len(video_ids), current="",
-        current_video_id=None, errors=0, last_error="", finished_at=0.0,
-    )
-    _CANCEL.clear()
+    if not _claimed:
+        with _LOCK:
+            if STATUS["running"]:
+                return
+            STATUS.update(
+                running=True, done=0, total=len(video_ids), current="",
+                current_video_id=None, errors=0, last_error="", finished_at=0.0,
+            )
+            _CANCEL.clear()
     try:
         with db.get_db() as conn:
             settings = get_ai_settings(conn)
@@ -334,7 +376,8 @@ def run_job(video_ids: list[int]) -> None:
                 STATUS["last_error"] = f"{row['filename']}: {e}"
             STATUS["done"] += 1
     finally:
-        STATUS.update(
-            running=False, current="", current_video_id=None,
-            finished_at=time.time(),
-        )
+        with _LOCK:
+            STATUS.update(
+                running=False, current="", current_video_id=None,
+                finished_at=time.time(),
+            )

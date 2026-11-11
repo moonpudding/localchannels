@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator, Optional
 
-from . import compat
+from . import compat, db
 from .config import config
 
 PROBE_WORKERS = 4
@@ -49,7 +49,10 @@ def scope_clause(folder: str, recursive: bool) -> tuple[str, list]:
     if not f:
         return ("", []) if recursive else (" WHERE v.folder = ''", [])
     if recursive:
-        return " WHERE (v.folder = ? OR v.folder LIKE ?)", [f, f"{f}/%"]
+        return (
+            " WHERE (v.folder = ? OR v.folder LIKE ? ESCAPE '\\')",
+            [f, f"{db.escape_like(f)}/%"],
+        )
     return " WHERE v.folder = ?", [f]
 
 
@@ -301,7 +304,7 @@ def probe_details(path: Path) -> dict:
 
 def _detail_for(rel_path: str) -> dict:
     path = (config.root_path / rel_path).resolve()
-    if not str(path).startswith(str(config.root_path)) or not path.is_file():
+    if not path.is_relative_to(config.root_path.resolve()) or not path.is_file():
         return {"probe_error": "file not found"}
     return probe_details(path)
 

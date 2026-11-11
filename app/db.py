@@ -132,7 +132,14 @@ def _connect() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = NORMAL")
+    conn.execute("PRAGMA busy_timeout = 30000")
     return conn
+
+
+def escape_like(value: str) -> str:
+    """Escape SQLite LIKE wildcards (%, _, \\) for use with ESCAPE '\\'."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def init_db() -> None:
@@ -312,6 +319,47 @@ def play_count(conn: sqlite3.Connection, video_id: int) -> int:
         "SELECT COUNT(*) AS c FROM watch_history WHERE video_id = ?", (video_id,)
     ).fetchone()
     return row["c"] if row else 0
+
+
+def play_stats_map(
+    conn: sqlite3.Connection, video_ids: Optional[Iterable[int]] = None
+) -> dict[int, tuple[int, Optional[float]]]:
+    """Return {video_id: (play_count, last_played)} in a single query."""
+    if video_ids is not None:
+        ids = list(dict.fromkeys(int(v) for v in video_ids))
+        if not ids:
+            return {}
+        if len(ids) <= 500:
+            ph = ", ".join("?" for _ in ids)
+            rows = conn.execute(
+                f"SELECT video_id, COUNT(*) AS c, MAX(played_at) AS t "
+                f"FROM watch_history WHERE video_id IN ({ph}) GROUP BY video_id",
+                ids,
+            ).fetchall()
+            return {r["video_id"]: (r["c"], r["t"]) for r in rows}
+    rows = conn.execute(
+        "SELECT video_id, COUNT(*) AS c, MAX(played_at) AS t "
+        "FROM watch_history GROUP BY video_id"
+    ).fetchall()
+    return {r["video_id"]: (r["c"], r["t"]) for r in rows}
+
+
+def folder_tree_counts(conn: sqlite3.Connection) -> dict[str, int]:
+    """Return {folder_path: recursive_video_count} for every folder in one query."""
+    rows = conn.execute(
+        "SELECT folder, COUNT(*) AS c FROM videos WHERE folder != '' GROUP BY folder"
+    ).fetchall()
+    counts: dict[str, int] = {}
+    for r in rows:
+        folder = r["folder"]
+        c = r["c"]
+        acc = ""
+        for part in folder.split("/"):
+            if not part:
+                continue
+            acc = f"{acc}/{part}" if acc else part
+            counts[acc] = counts.get(acc, 0) + c
+    return counts
 
 
 def record_play(conn: sqlite3.Connection, video_id: int) -> None:
@@ -587,6 +635,21 @@ def tags_for_video(conn: sqlite3.Connection, video_id: int) -> list[str]:
     return [r["name"] for r in rows]
 
 
+def video_tags_map(conn: sqlite3.Connection) -> dict[int, list[str]]:
+    """Return {video_id: [tag_name, ...]} for all tagged videos in one query."""
+    out: dict[int, list[str]] = {}
+    rows = conn.execute(
+        """
+        SELECT vt.video_id, t.name FROM video_tags vt
+        JOIN tags t ON t.id = vt.tag_id
+        ORDER BY t.name
+        """
+    ).fetchall()
+    for r in rows:
+        out.setdefault(r["video_id"], []).append(r["name"])
+    return out
+
+
 def add_tag(conn: sqlite3.Connection, video_id: int, name: str) -> None:
     tag_id = get_or_create_tag(conn, name)
     conn.execute(
@@ -687,15 +750,14 @@ def _filter_clause(
 
     if text.strip():
         # Escape LIKE wildcards so a literal % or _ in a filename still matches.
-        esc = (text.strip().lower()
-               .replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_"))
+        esc = escape_like(text.strip().lower())
         where.append("LOWER(v.rel_path) LIKE ? ESCAPE '\\'")
         params.append(f"%{esc}%")
 
     if folder.strip("/"):
         f = folder.strip("/")
-        where.append("(v.folder = ? OR v.folder LIKE ?)")
-        params.extend([f, f"{f}/%"])
+        where.append("(v.folder = ? OR v.folder LIKE ? ESCAPE '\\')")
+        params.extend([f, f"{escape_like(f)}/%"])
 
     clause = (" WHERE " + " AND ".join(where)) if where else ""
     return clause, params

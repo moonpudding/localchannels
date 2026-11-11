@@ -76,6 +76,7 @@ More options in [Run with Docker](#run-with-docker). No Docker? See
 - [Run without Docker](#run-without-docker)
 - [Configuration](#configuration)
 - [Themes](#themes)
+- [Folder artwork](#folder-artwork)
 - [Password protection](#password-protection)
 - [Filtering by tags](#filtering-by-tags)
 - [Tags and filenames](#tags-and-filenames)
@@ -100,6 +101,9 @@ More options in [Run with Docker](#run-with-docker). No Docker? See
 - **File browser** — a collapsible folder tree in the sidebar, with breadcrumbs
   and expand/collapse state remembered between visits
 - **Folder view** — a thumbnail grid of everything in the current folder
+- **Folder artwork** — a `folder.jpg` or `folder.png` in a folder is shown on its
+  tile, and a `backdrop.jpg` or `backdrop.png` becomes the background of its
+  library page, with adjustable dim and blur. See [Folder artwork](#folder-artwork)
 - **Thumbnail or list view** — a toggle beside the sort controls switches every
   listing between the poster grid and a dense table showing filename, folder,
   file size, file date, date added, resolution, duration and frame rate. The
@@ -109,7 +113,8 @@ More options in [Run with Docker](#run-with-docker). No Docker? See
   resolution (pixel count) or file size, ascending or descending
 - **Video page** — full metadata table (including file date and date added) and
   an inline player with HTTP range streaming, so seeking works and the browser
-  only pulls the bytes it needs
+  only pulls the bytes it needs. **Go to folder** opens the folder the video
+  lives in
 - **Clear playback errors** — when the browser can't play a file, the player
   says why (unsupported container, codec it can't decode, decoder failure, or a
   missing file) and suggests the ffmpeg command that fixes it, instead of
@@ -246,8 +251,9 @@ More options in [Run with Docker](#run-with-docker). No Docker? See
 - **Nine themes** — Catppuccin (Mocha, Macchiato, Frappé, Latte), Plain Dark,
   Plain Light, Nord, Rosé Pine and Gruvbox. See [Themes](#themes)
 - **Configurable site name** in the header and browser tab
-- **Optional password protection** — a single shared password, no accounts. See
-  [Password protection](#password-protection)
+- **Optional password protection** — a single shared password, no accounts,
+  switched on and off from the settings page, with sign-ins that last 1, 7, 30
+  or 90 days. See [Password protection](#password-protection)
 
 ### ⚙️ Settings
 
@@ -255,7 +261,7 @@ Everything above is configured from the cogwheel in the top bar:
 
 | Section | What's there |
 |---------|--------------|
-| **General** | Theme, autoplay, channel order, library backup, and a Debugging group (VR playback report) |
+| **General** | Theme, autoplay, channel order, folder artwork (backgrounds, dim, blur), password protection, library backup, and a Debugging group (VR playback report) |
 | **Media Management** | Rescan (incremental or full), duplicate detection, media report (CSV), browser-incompatible files, thumbnail cache cleanup, reset watched status, clear play history |
 | **Tag Management** | Filename tag settings (delimiter, title stripping, auto-tagging, unwritten-tag warning), writing tags into filenames, then *Manage Tags* to add, rename and delete tags library-wide |
 | **AI Analysis** | Endpoint, model, API key, reasoning toggle, frame sampling, system prompt, and batch runs |
@@ -289,9 +295,7 @@ services:
     environment:
       LOCALCHANNELS_SITE_NAME: "LocalChannels"
       LOCALCHANNELS_DEFAULT_THEME: "mocha"
-      # Password protection (off by default). Set BOTH to enable:
-      # LOCALCHANNELS_AUTH_ENABLED: "true"
-      # LOCALCHANNELS_PASSWORD: "change-me"
+      # Password protection is set up in the app: Settings → General.
       # Optional tuning:
       # LOCALCHANNELS_THUMBNAIL_WIDTH: "480"
       # LOCALCHANNELS_THUMBNAIL_SEEK_FRACTION: "0.20"
@@ -436,20 +440,20 @@ for Docker, and they win over the file).
 | `thumbnail_width` | `LOCALCHANNELS_THUMBNAIL_WIDTH` | `480` | Thumbnail width in px (height is automatic) |
 | `thumbnail_seek_fraction` | `LOCALCHANNELS_THUMBNAIL_SEEK_FRACTION` | `0.20` | Where in each video the poster frame is grabbed (0.0–1.0) |
 | `video_extensions` | `LOCALCHANNELS_VIDEO_EXTENSIONS` | `.mp4 .mkv .webm .avi .mov .m4v .flv .wmv .mpg .mpeg .ts` | File types treated as videos. Comma-separated in the env var, e.g. `.mp4,.mkv,.webm` |
-| `auth_enabled` | `LOCALCHANNELS_AUTH_ENABLED` | `false` | Turn on shared-password protection |
-| `password` | `LOCALCHANNELS_PASSWORD` | (unset) | The password — required for auth to actually activate |
+| `auth_enabled` | `LOCALCHANNELS_AUTH_ENABLED` | `false` | First run only: start with password protection on. Managed in Settings → General afterwards |
+| `password` | `LOCALCHANNELS_PASSWORD` | (unset) | First run only: the initial password. Managed in Settings → General afterwards |
 
-Two more environment variables have no `config.json` equivalent, since they say
-where those files live:
+A few more environment variables have no `config.json` equivalent:
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
 | `LOCALCHANNELS_CONFIG` | `./config.json` | Path to the config file |
 | `LOCALCHANNELS_ABOUT` | `./about.json` | Path to the About page metadata |
+| `LOCALCHANNELS_AUTH_RESET` | (unset) | Set to `true` to discard the saved password at startup — see [Password protection](#password-protection) |
 
-Everything else — tag settings, AI settings, channel order, autoplay — is set
-in the Settings page and stored in the database, so it survives container
-updates.
+Everything else — password protection, folder artwork, tag settings, AI
+settings, channel order, autoplay — is set in the Settings page and stored in
+the database, so it survives container updates.
 
 ---
 
@@ -472,18 +476,86 @@ Set the starting theme with `default_theme`.
 
 ---
 
+## Folder artwork
+
+Two image files in a folder change how it looks in the library. Both are read
+straight from disk when the page loads, so adding or replacing one shows up on
+the next visit — no rescan needed.
+
+| File | Where it shows |
+|------|----------------|
+| `folder.jpg` / `folder.png` | On the folder's tile in the library |
+| `backdrop.jpg` / `backdrop.png` | Behind the folder's library page |
+
+`.jpeg` works too, names are matched without regard to case (`Folder.JPG` is
+fine), and when a folder has both a JPEG and a PNG the JPEG wins.
+
+**Folder tiles.** The picture is always shown whole, never cropped: one that is
+close to the tile's 16:9 shape fills it, and anything else — a poster, a square
+cover — is centred over a blurred copy of itself. Folders without a picture
+show the folder icon. Tile images are downscaled once with ffmpeg and cached in
+`data/folder-art/`, so a library full of multi-megabyte posters still loads
+quickly; if ffmpeg can't read a file, the original is used as it is.
+
+**Backgrounds.** A backdrop applies to the page of the folder it sits in,
+including the top folder of the library, where it backs the Library page
+itself. It is not inherited: a subfolder without its own backdrop has none.
+Backdrops appear only while browsing folders, not on video pages or other
+views.
+
+**Settings → General → Folder artwork** has the controls, with a live preview:
+
+| Setting | Default | Meaning |
+|---------|---------|---------|
+| **Folder backgrounds** | on | Show backdrop images at all |
+| **Dim** | 60% | How far the image fades into the theme's background colour. 0% shows it as is; raise it if text gets hard to read |
+| **Blur** | 6 px | Softens the image. 0 px leaves it sharp |
+
+These are stored in the database, so they apply to every device.
+
+---
+
 ## Password protection
 
-Set both `LOCALCHANNELS_AUTH_ENABLED=true` and `LOCALCHANNELS_PASSWORD=...` to
-require a password. Visitors get a sign-in page; on success a session cookie
-(valid 30 days) is set and a Sign-out button appears in the header. If
-`AUTH_ENABLED` is on but no password is set, protection stays off and a warning
-is logged.
+Everything is set in **Settings → General → Password protection**:
 
-This is deliberately simple: one shared password, a cookie derived from it, no
-user accounts. It's meant to keep casual visitors out on a trusted network, not
-as hardened security. Put it behind HTTPS — a reverse proxy with a valid
-certificate — if you expose it to the internet.
+| Setting | Meaning |
+|---------|---------|
+| **Require a password** | Turns protection on or off. It can't be turned on until a password is set |
+| **Password** | Sets or changes the password. Changing it signs out every other browser |
+| **Stay signed in for** | How long a sign-in lasts: 1, 7, 30 (the default) or 90 days |
+
+With protection on, visitors get a sign-in page; on success a session cookie is
+set and a Sign-out button appears in the header. The browser you turn it on
+from stays signed in.
+
+The validity period counts from the moment of signing in and is checked on the
+server, so it isn't just a cookie lifetime: shorten it from 30 days to 1 and a
+browser that signed in a week ago is asked for the password on its next
+request.
+
+### Environment variables and config.json
+
+`LOCALCHANNELS_AUTH_ENABLED` / `LOCALCHANNELS_PASSWORD` (or `auth_enabled` /
+`password` in `config.json`) still work as a starting point: they are imported
+the first time the app starts without a saved password, and ignored after
+that. An existing setup that used them keeps its password and stays protected
+after updating; from then on, change things in the settings page.
+
+### Forgotten password
+
+Start the app once with `LOCALCHANNELS_AUTH_RESET=true`. The saved password is
+discarded and protection is turned off, so you can get in and set a new one.
+If `LOCALCHANNELS_PASSWORD` is also set, that value is imported again instead.
+Remove the variable afterwards — while it is set, every restart resets.
+
+### How secure is it
+
+This is deliberately simple: one shared password, no user accounts. The
+password is stored only as a salted PBKDF2 hash, and the session cookie is
+signed with a random per-install key. It's meant to keep casual visitors out on
+a trusted network, not as hardened security. Put it behind HTTPS — a reverse
+proxy with a valid certificate — if you expose it to the internet.
 
 ---
 
@@ -785,11 +857,14 @@ itself. The three answers worth knowing:
 | `No response from … within 45s` | The endpoint accepted the connection and then went quiet — usually a model still loading, or one swapped to CPU |
 | `The model used its whole token budget on reasoning…` | A reasoning model (Qwen3 and similar) thought until it ran out of tokens and never answered |
 
-For the last one, turn on **Skip reasoning tokens**. It sends
-`chat_template_kwargs: {"enable_thinking": false}`, which vLLM passes to the
-chat template. It is off by default because a server that doesn't recognise the
-field rejects the whole request — the OpenAI API among them. Any `<think>`
-block that does come back is stripped from the stored summary either way.
+For the last one, set **Thinking** to **Disabled** (or **Enabled** if you want
+reasoning on a server that defaults it off; enabling also raises the token
+budget to 4096 so reasoning models have room to finish). Setting **Enabled** or
+**Disabled** sends `chat_template_kwargs: {"enable_thinking": true/false}`,
+which vLLM passes to the chat template. Leave it on **Server default** for
+endpoints that don't recognise `chat_template_kwargs` — the OpenAI API among
+them. Any `<think>` block that does come back is stripped from the stored
+summary either way.
 
 Reasoning also explains slowness rather than failure: every summary pays for
 hundreds of thinking tokens before the first useful word, which is why a smaller
@@ -811,7 +886,9 @@ copy to your browser. The archive contains:
 | `manifest.json` | Timestamp, row counts, and what the archive contains |
 
 The database holds everything you've done in the app: tags, favorites, watch
-history, resume points, channels, duplicate ignores, AI summaries and settings.
+history, resume points, channels, duplicate ignores, AI summaries and settings
+— including the password hash, so a restored backup comes back with the same
+password and protection setting.
 
 Only one backup is kept — each run replaces the previous file. It's built to a
 temporary file and moved into place atomically, so an interrupted or failed run
@@ -898,6 +975,7 @@ in Docker):
 |------|------------|
 | `library.db` | SQLite database — videos, watch history, tags, channels, AI summaries, settings |
 | `thumbnails/` | Cached JPEG posters |
+| `folder-art/` | Downscaled copies of `folder.jpg`/`folder.png` for the library tiles. Safe to delete; rebuilt on demand |
 | `backups/localchannels-backup.zip` | The most recent backup, if you've made one |
 
 `config.json` and `about.json` sit in the project root and are part of the

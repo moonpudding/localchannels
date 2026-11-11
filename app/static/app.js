@@ -27,10 +27,25 @@ const state = {
   page: 0,
   vrDebug: false,    // VR timing report — opt-in, see Settings > General > Debugging
   viewMode: "grid",   // "grid" (thumbnails) | "list"
+  // Folder backdrops — server settings (Settings → General), loaded in init().
+  backdrop: { enabled: true, dim: 60, blur: 6 },
+  lastBackdrop: null, // most recent backdrop shown, reused by the settings preview
 };
 
 // Set by the video page; the router calls it to flush playback progress on exit.
 let leaveVideo = null;
+
+// Explicitly abort any open /api/stream Range request before discarding a
+// <video> element; otherwise HTTP/1.1's 6-connection-per-origin limit can
+// starve subsequent API calls until garbage collection runs.
+function releaseVideo(video) {
+  if (!video) return;
+  try {
+    video.pause();
+    video.removeAttribute("src");
+    video.load();
+  } catch (e) {}
+}
 
 /* ------------------------------------------------------------------ utils */
 const api = {
@@ -476,6 +491,69 @@ function viewBar(refresh) {
   ]);
 }
 
+/* ------------------------------------------------------- folder backdrops */
+// The backdrop the current page wants (null for none). Images are preloaded,
+// so this is what tells a late-arriving load whether it is still wanted.
+let backdropWanted = null;
+let backdropShown = null;
+
+function applyBackdropStyle(node = document.getElementById("backdrop")) {
+  if (!node) return;
+  node.style.setProperty("--bd-dim", String(state.backdrop.dim / 100));
+  node.style.setProperty("--bd-blur", `${state.backdrop.blur}px`);
+}
+
+// Show a folder's backdrop behind the page, or fade it out with null.
+function setBackdrop(url) {
+  const node = document.getElementById("backdrop");
+  if (!node) return;
+  if (!state.backdrop.enabled) url = null;
+  backdropWanted = url || null;
+  if (!url) { node.classList.remove("show"); return; }
+  state.lastBackdrop = url;
+  if (backdropShown === url) { node.classList.add("show"); return; }
+  const pre = new Image();
+  pre.onload = () => {
+    if (backdropWanted !== url) return;          // navigated on while it loaded
+    node.querySelector(".backdrop-img").style.backgroundImage = `url("${url}")`;
+    backdropShown = url;
+    node.classList.add("show");
+  };
+  pre.onerror = () => { if (backdropWanted === url) node.classList.remove("show"); };
+  pre.src = url;
+}
+
+/* ------------------------------------------------------------ folder tiles */
+const TILE_RATIO = 16 / 9;
+
+function folderTile(f) {
+  const label = el("div", { class: "ft-label" }, [
+    el("div", { class: "ft-name", title: f.name }, f.name),
+    el("div", { class: "ft-count" }, `${f.count} video${f.count === 1 ? "" : "s"}`),
+  ]);
+  const tile = el("div", { class: "folder-tile", onClick: () => go("browse", f.path) });
+  const showIcon = () => {
+    tile.classList.remove("has-art");
+    tile.replaceChildren(el("div", { class: "ft-icon", html: ICON.folder }), label);
+  };
+  if (!f.image) { showIcon(); return tile; }
+
+  tile.classList.add("has-art");
+  const fill = el("div", { class: "ft-fill" });
+  const art = el("img", { class: "ft-art", src: f.image, loading: "lazy", alt: "" });
+  art.addEventListener("load", () => {
+    // A picture that is already close to the tile's shape just fills it. Any
+    // other shape is shown whole, over a blurred copy of itself. The copy is
+    // only set once the image has loaded, so lazy loading still applies.
+    const ratio = art.naturalWidth / art.naturalHeight;
+    if (Math.abs(ratio - TILE_RATIO) / TILE_RATIO < 0.15) art.style.objectFit = "cover";
+    else fill.style.backgroundImage = `url("${f.image}")`;
+  });
+  art.addEventListener("error", showIcon);     // unreadable file: fall back to the icon
+  tile.append(fill, art, label);
+  return tile;
+}
+
 async function renderBrowse() {
   setActiveNav("browse", state.path);
   const c = main();
@@ -502,9 +580,14 @@ async function renderBrowse() {
       `/api/browse?path=${encodeURIComponent(state.path)}&sort=${state.sort.field}&order=${state.sort.order}`
     );
   } catch (e) {
+    setBackdrop(null);
     c.appendChild(el("div", { class: "empty" }, [el("h2", {}, "Could not load folder")]));
     return;
   }
+
+  // Only if this is still the page on screen — the request may have been
+  // overtaken by a click elsewhere.
+  if (state.view === "browse" && state.path === data.path) setBackdrop(data.backdrop);
 
   if (data.folders.length === 0 && data.videos.length === 0) {
     c.appendChild(emptyLibrary());
@@ -513,16 +596,8 @@ async function renderBrowse() {
 
   if (data.folders.length) {
     c.appendChild(el("div", { class: "section-title" }, "Folders"));
-    const g = el("div", { class: "grid" });
-    data.folders.forEach((f) => {
-      g.appendChild(el("div", { class: "folder-tile", onClick: () => go("browse", f.path) }, [
-        el("span", { html: ICON.folder }),
-        el("div", {}, [
-          el("div", { class: "ft-name", title: f.name }, f.name),
-          el("div", { class: "ft-count" }, `${f.count} video${f.count === 1 ? "" : "s"}`),
-        ]),
-      ]));
-    });
+    const g = el("div", { class: "folder-grid" });
+    data.folders.forEach((f) => g.appendChild(folderTile(f)));
     c.appendChild(g);
   }
 
@@ -820,7 +895,8 @@ function mountVRViewer(host, video, v, id) {
     if (document.fullscreenElement) document.exitFullscreen();
     else if (stage.requestFullscreen) stage.requestFullscreen();
   });
-  document.addEventListener("fullscreenchange", () => stage.classList.toggle("fs", document.fullscreenElement === stage));
+  const onFsChange = () => stage.classList.toggle("fs", document.fullscreenElement === stage);
+  document.addEventListener("fullscreenchange", onFsChange);
 
   const bar = el("div", { class: "vr-bar" }, [playBtn, seek, timeLbl, projBtn, layoutBtn, rendBtn, reportBtn, recenterBtn, fsBtn]);
 
@@ -1500,6 +1576,8 @@ function mountVRViewer(host, video, v, id) {
   return () => {
     cancelAnimationFrame(raf);
     clearTimeout(hideTimer);
+    stopRVFC();
+    document.removeEventListener("fullscreenchange", onFsChange);
     if (xrSession) xrSession.end().catch(() => {});
     if (document.fullscreenElement === stage) document.exitFullscreen().catch(() => {});
   };
@@ -1706,8 +1784,9 @@ async function renderVideo(id) {
   };
 
   // ── Progress / resume / watched tracking ──
+  let leftPage = false;
   const reportProgress = () => {
-    if (!video.duration || isNaN(video.duration)) return;
+    if (leftPage || !video.duration || isNaN(video.duration)) return;
     api.post(`/api/video/${id}/progress`, {
       position: video.currentTime || 0, duration: video.duration,
     }).catch(() => {});
@@ -1721,7 +1800,7 @@ async function renderVideo(id) {
   video.addEventListener("ended", reportProgress);
   // Flush on tab close via a beacon (survives page unload).
   const beacon = () => {
-    if (!video.duration || isNaN(video.duration)) return;
+    if (leftPage || !video.duration || isNaN(video.duration)) return;
     try {
       const blob = new Blob(
         [JSON.stringify({ position: video.currentTime || 0, duration: video.duration })],
@@ -1733,9 +1812,13 @@ async function renderVideo(id) {
   window.addEventListener("pagehide", beacon);
   // Called by the router when navigating away from this page.
   leaveVideo = () => {
+    if (leftPage) return;
     window.removeEventListener("pagehide", beacon);
     clearTimeout(aiPollTimer); // stop AI status polling for this page
     reportProgress();
+    leftPage = true;
+    if (vrCleanup) { vrCleanup(); vrCleanup = null; }
+    releaseVideo(video);
   };
 
   // ── Player host: flat player or VR viewer ──
@@ -2012,8 +2095,15 @@ async function renderVideo(id) {
   tagPanel.appendChild(popWrap);
   right.appendChild(tagPanel);
 
-  // channel-from-here shortcut
+  // jump to the folder this video lives in
   const folder = v.folder || "";
+  right.appendChild(el("button", {
+    class: "btn", style: "width:100%;margin-top:14px;justify-content:center",
+    title: folder ? `Open ${folder} in the library` : "Open the library root",
+    onClick: () => navigate("browse", folder),
+  }, [el("span", { html: ICON.folder }), "Go to folder"]));
+
+  // channel-from-here shortcut
   right.appendChild(el("button", {
     class: "btn", style: "width:100%;margin-top:14px;justify-content:center",
     onClick: () => startChannel(folder, []),
@@ -2057,7 +2147,7 @@ async function renderVideo(id) {
 
   cols.appendChild(right);
   detail.appendChild(cols);
-  c.appendChild(detail);
+  if (!leftPage) c.appendChild(detail);
 }
 
 async function renderHistory() {
@@ -2335,8 +2425,176 @@ async function settingsGeneral(body) {
     "How channel mode picks the next video. Sequential follows filename order; either way each video plays once before the channel loops.",
     orderSel));
 
+  settingsArtwork(body);
+  await settingsAccess(body);
   await settingsBackup(body);
   settingsDebug(body);
+}
+
+/* ------------------------------------------------------ settings: artwork */
+
+function rangeSetting(value, min, max, unit, onInput, onCommit) {
+  const input = el("input", { type: "range", min, max, step: "1" });
+  input.value = value;
+  const label = el("span", { class: "sr-value" }, `${value}${unit}`);
+  input.addEventListener("input", () => {
+    label.textContent = `${input.value}${unit}`;
+    onInput(parseInt(input.value, 10));
+  });
+  input.addEventListener("change", () => onCommit(parseInt(input.value, 10)));
+  return el("div", { class: "setting-range" }, [input, label]);
+}
+
+function settingsArtwork(body) {
+  body.appendChild(el("h2", { class: "settings-section-title", style: "margin-top:40px" }, "Folder artwork"));
+  body.appendChild(el("p", { class: "settings-section-desc" }, [
+    "Put ", el("code", {}, "backdrop.jpg"), " or ", el("code", {}, "backdrop.png"),
+    " in a folder to give its library page a background — the top folder of the library " +
+    "included. ", el("code", {}, "folder.jpg"), " or ", el("code", {}, "folder.png"),
+    " is shown on the folder's tile. These settings apply on every device.",
+  ]));
+
+  const save = async (key, value) => {
+    try { await api.post("/api/settings", { key, value: String(value) }); return true; }
+    catch (e) { toast(e.message || "Could not save that setting"); return false; }
+  };
+
+  // Miniature of a library page. Blur is scaled to the preview's size so it
+  // reads the same as it will at full width.
+  const preview = el("div", { class: "backdrop-preview" });
+  const pvImg = el("div", { class: "backdrop-img" });
+  const pvDim = el("div", { class: "backdrop-dim" });
+  const pvEmpty = el("div", { class: "bp-empty" });
+  preview.append(pvImg, pvDim, el("div", { class: "bp-content" }, [
+    el("div", { class: "bp-title" }, "Library"),
+    el("div", { class: "bp-sub" }, "Preview of a folder page with a backdrop"),
+  ]), pvEmpty);
+  const syncPreview = () => {
+    const full = (mainEl() && mainEl().clientWidth) || 1200;
+    const scale = Math.min(1, (preview.clientWidth || 600) / full);
+    preview.style.setProperty("--bd-dim", String(state.backdrop.dim / 100));
+    preview.style.setProperty("--bd-blur", `${(state.backdrop.blur * scale).toFixed(2)}px`);
+    preview.style.opacity = state.backdrop.enabled ? "1" : "0.45";
+  };
+  // The last backdrop seen while browsing, else the library root's.
+  const src = state.lastBackdrop || "/api/folder-image?path=&kind=backdrop";
+  const probe = new Image();
+  probe.onload = () => { pvImg.style.backgroundImage = `url("${src}")`; };
+  probe.onerror = () => {
+    pvDim.style.display = "none";
+    pvEmpty.textContent = "No backdrop to preview yet — open a folder that has a " +
+      "backdrop.jpg or backdrop.png, then come back.";
+  };
+  probe.src = src;
+
+  body.appendChild(settingRow("Folder backgrounds",
+    "Show a folder's backdrop image behind its library page.",
+    toggleSwitch(state.backdrop.enabled, async (on) => {
+      state.backdrop.enabled = on;
+      syncPreview();
+      if (await save("folder_backdrops", on ? "1" : "0")) {
+        toast(on ? "Folder backgrounds on" : "Folder backgrounds off");
+      }
+    })));
+  body.appendChild(settingRow("Dim",
+    "Fades the image into the theme's background so text stays readable. 0% shows it as is.",
+    rangeSetting(state.backdrop.dim, 0, 90, "%",
+      (v) => { state.backdrop.dim = v; applyBackdropStyle(); syncPreview(); },
+      (v) => save("folder_backdrop_dim", v))));
+  body.appendChild(settingRow("Blur",
+    "Softens the image. 0 px leaves it sharp.",
+    rangeSetting(state.backdrop.blur, 0, 40, " px",
+      (v) => { state.backdrop.blur = v; applyBackdropStyle(); syncPreview(); },
+      (v) => save("folder_backdrop_blur", v))));
+  body.appendChild(preview);
+  // Needs its real width, which it only has once the page is in the document.
+  requestAnimationFrame(syncPreview);
+}
+
+/* -------------------------------------------------------- settings: access */
+
+// The Sign-out button only makes sense while a password is required.
+function syncLogoutButton() {
+  const btn = document.getElementById("logout-btn");
+  if (btn) btn.style.display = state.config.auth_enabled ? "" : "none";
+}
+
+async function settingsAccess(body) {
+  body.appendChild(el("h2", { class: "settings-section-title", style: "margin-top:40px" }, "Password protection"));
+  body.appendChild(el("p", { class: "settings-section-desc" },
+    "Ask for a shared password before anyone can open the library. One password, no " +
+    "accounts — meant to keep casual visitors out on a trusted network."));
+
+  let st;
+  try { st = await api.get("/api/auth"); }
+  catch (e) {
+    body.appendChild(el("p", { class: "settings-section-desc" }, "Could not load the password settings."));
+    return;
+  }
+
+  const pwHint = el("div", {});
+  const pwInput = el("input", {
+    type: "password", class: "ai-input", autocomplete: "new-password",
+    placeholder: "New password", "aria-label": "New password",
+  });
+  const pwBtn = el("button", { class: "btn primary" });
+  const enableSwitch = toggleSwitch(st.enabled, (on) => save({ enabled: on }, on
+    ? "Password protection is on" : "Password protection is off"));
+  const enableInput = enableSwitch.querySelector("input");
+
+  const sync = () => {
+    enableInput.checked = st.enabled;
+    pwBtn.textContent = st.has_password ? "Change password" : "Set password";
+    pwHint.textContent = st.has_password
+      ? "A password is set. Changing it signs out every other browser."
+      : "No password yet — set one to be able to turn protection on.";
+    state.config.auth_enabled = st.enabled;
+    syncLogoutButton();
+  };
+
+  // Every change goes through one call; the server answers with the full
+  // state, so the controls always show what was actually saved.
+  const save = async (change, okMsg) => {
+    try {
+      st = await api.post("/api/auth", change);
+      toast(okMsg);
+      return true;
+    } catch (e) {
+      toast(e.message || "Could not save that setting");
+      return false;
+    } finally { sync(); }
+  };
+
+  const savePassword = async () => {
+    if (!pwInput.value) { toast("Type a password first"); pwInput.focus(); return; }
+    const first = !st.has_password;
+    if (await save({ password: pwInput.value }, first ? "Password set" : "Password changed")) {
+      pwInput.value = "";
+    }
+  };
+  pwBtn.addEventListener("click", savePassword);
+  pwInput.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); savePassword(); } });
+
+  const daysSel = el("select", { class: "theme" }, st.session_day_options.map((d) =>
+    el("option", { value: String(d) }, d === 1 ? "1 day" : `${d} days`)));
+  daysSel.value = String(st.session_days);
+  daysSel.addEventListener("change", async () => {
+    const d = parseInt(daysSel.value, 10);
+    if (!(await save({ session_days: d }, `Sign-ins now last ${d === 1 ? "1 day" : d + " days"}`))) {
+      daysSel.value = String(st.session_days);
+    }
+  });
+
+  body.appendChild(settingRow("Require a password",
+    "Visitors get a sign-in page. This browser stays signed in when you turn it on.",
+    enableSwitch));
+  body.appendChild(settingRow("Password", pwHint,
+    el("div", { class: "setting-inline" }, [pwInput, pwBtn])));
+  body.appendChild(settingRow("Stay signed in for",
+    "How long a sign-in lasts before the password is asked for again. Counted from the " +
+    "moment of signing in, and applied to browsers that are already signed in.",
+    daysSel));
+  sync();
 }
 
 function settingsDebug(body) {
@@ -3188,15 +3446,24 @@ async function settingsAI(body) {
     "Send a tiny text-only request to verify the endpoint, model and key.",
     el("div", { class: "ai-test-wrap" }, [testBtn, testOut])));
 
-  const thinkToggle = toggleSwitch(s.ai_disable_thinking === "1", async (on) => {
-    await saveSetting("ai_disable_thinking", on ? "1" : "0");
+  const curThink = s.ai_thinking || (s.ai_disable_thinking === "1" ? "disabled" : "default");
+  const thinkSel = el("select", { class: "theme" }, [
+    el("option", { value: "default", ...(curThink === "default" ? { selected: "" } : {}) }, "Server default"),
+    el("option", { value: "enabled", ...(curThink === "enabled" ? { selected: "" } : {}) }, "Enabled"),
+    el("option", { value: "disabled", ...(curThink === "disabled" ? { selected: "" } : {}) }, "Disabled"),
+  ]);
+  thinkSel.addEventListener("change", async () => {
+    if (await saveSetting("ai_thinking", thinkSel.value)) {
+      toast(thinkSel.value === "enabled" ? "Thinking enabled"
+        : thinkSel.value === "disabled" ? "Thinking disabled"
+        : "Using server default for thinking");
+    }
   });
-  body.appendChild(settingRow("Skip reasoning tokens",
-    "Reasoning models (Qwen3 and friends) spend their token budget thinking " +
-    "before they answer, which is slow and can return nothing at all. This " +
-    "asks the server to turn thinking off. vLLM and most local servers accept " +
-    "it; the OpenAI API does not, so leave it off there.",
-    thinkToggle));
+  body.appendChild(settingRow("Thinking",
+    "Enable or disable model reasoning tokens (sends chat_template_kwargs.enable_thinking " +
+    "to vLLM and compatible local servers; any <think> block is stripped from the stored " +
+    "summary either way). Leave on Server default for the OpenAI API.",
+    thinkSel));
 
   // ── Frame sampling ──
   body.appendChild(el("h2", { class: "settings-section-title", style: "margin-top:40px" }, "Frame sampling"));
@@ -4171,6 +4438,7 @@ async function startChannel(folder, tags, exclude, mode) {
 
 function renderChannelPlayer(data) {
   const root = document.getElementById("channel-root");
+  root.querySelectorAll("video").forEach(releaseVideo);
   root.innerHTML = "";
   const v = data.video;
   state.channel.current = v;
@@ -4294,7 +4562,9 @@ function channelKeys(e) {
 
 function closeChannel() {
   document.removeEventListener("keydown", channelKeys);
-  document.getElementById("channel-root").innerHTML = "";
+  const root = document.getElementById("channel-root");
+  root.querySelectorAll("video").forEach(releaseVideo);
+  root.innerHTML = "";
   state.channel = null;
 }
 
@@ -4757,6 +5027,10 @@ async function route() {
   restoringScroll = true;                    // suppress saves during the render
 
   const out = routeView();
+  // Backdrops belong to library folders. Every view sets state.view before its
+  // first await, so this already knows where we landed. Folder-to-folder moves
+  // are left to renderBrowse, which swaps the image once it knows the new one.
+  if (state.view !== "browse") setBackdrop(null);
   scrollKey = targetKey;
   try { await out; } catch (e) { /* view reports its own errors */ }
   restoreScroll(want);
@@ -4824,8 +5098,19 @@ async function init() {
     const vm = prefGet("view");
     if (vm === "list" || vm === "grid") state.viewMode = vm;
   } catch (e) {}
-  state.config = await api.get("/api/config").catch(() => ({}));
+  const [cfg, settings] = await Promise.all([
+    api.get("/api/config").catch(() => ({})),
+    api.get("/api/settings").catch(() => ({})),
+  ]);
+  state.config = cfg;
   applyTheme(theme || state.config.default_theme || "mocha");
+  const num = (v, fallback) => (Number.isFinite(parseInt(v, 10)) ? parseInt(v, 10) : fallback);
+  state.backdrop = {
+    enabled: settings.folder_backdrops !== "0",
+    dim: num(settings.folder_backdrop_dim, 60),
+    blur: num(settings.folder_backdrop_blur, 6),
+  };
+  applyBackdropStyle();
   if (state.config.site_name) {
     document.getElementById("brand-name").textContent = state.config.site_name;
     document.getElementById("search").setAttribute("placeholder", `Search ${state.config.site_name}…`);
@@ -4839,15 +5124,13 @@ async function init() {
   });
   document.getElementById("settings-btn").addEventListener("click", () => navigate("settings"));
 
-  // Logout button (only visible when password protection is enabled).
-  if (state.config.auth_enabled) {
-    const logoutBtn = document.getElementById("logout-btn");
-    logoutBtn.style.display = "";
-    logoutBtn.addEventListener("click", async () => {
-      try { await api.post("/api/logout"); } catch (e) {}
-      location.href = "/login";
-    });
-  }
+  // Logout button (only visible when password protection is enabled, which
+  // can change at runtime from Settings → General).
+  document.getElementById("logout-btn").addEventListener("click", async () => {
+    try { await api.post("/api/logout"); } catch (e) {}
+    location.href = "/login";
+  });
+  syncLogoutButton();
 
   // Autoplay preference (off by default; the toggle lives in Settings → General).
   state.autoplay = prefGet("autoplay") === "1";
