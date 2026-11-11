@@ -2,6 +2,7 @@ services:
   localchannels:
     # build: .
     # Or, if you'd rather pull/tag a prebuilt image instead of building:
+    # image: localchannels:latest
     image: ghcr.io/moonpudding/localchannels:latest
     container_name: localchannels
     ports:
@@ -27,9 +28,9 @@ services:
     environment:
       LOCALCHANNELS_SITE_NAME: "LocalChannels"
       LOCALCHANNELS_DEFAULT_THEME: "mocha"
-      # Password protection (off by default). Set BOTH to enable:
-      # LOCALCHANNELS_AUTH_ENABLED: "true"
-      # LOCALCHANNELS_PASSWORD: "change-me"
+      # Password protection is set up in the app: Settings → General.
+      # Forgot the password? Start once with this, then remove it again:
+      # LOCALCHANNELS_AUTH_RESET: "true"
       # Optional extra tuning:
       # LOCALCHANNELS_THUMBNAIL_WIDTH: "480"
       # LOCALCHANNELS_THUMBNAIL_SEEK_FRACTION: "0.20"
