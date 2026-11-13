@@ -1785,14 +1785,45 @@ async function renderVideo(id) {
 
   // ── Progress / resume / watched tracking ──
   let leftPage = false;
+  // Setting the status by hand (the Mark as watched/unwatched button) must not
+  // be undone by the automatic rule a moment later:
+  //   progressQuiet — nothing has played since the click, so there is nothing
+  //                   new to report. Without this, leaving a finished video
+  //                   right after marking it unwatched would re-send its end
+  //                   position and mark it watched again.
+  //   manualStatus  — playback is still in the last stretch that counts as
+  //                   "finished", so reports keep the flag as chosen (letting
+  //                   the credits run doesn't re-mark it). It lets go as soon
+  //                   as playback is back below that point: marking a video
+  //                   unwatched and then watching it through marks it watched.
+  const WATCHED_DONE = 0.9;         // keep in step with WATCHED_DONE_FRACTION in main.py
+  let manualStatus = false;
+  let progressQuiet = false;
+  let manualChanges = 0;            // lets a reply that predates a click be ignored
+  let syncWatchedUi = () => {};     // set once the status row and button exist
+  video.addEventListener("playing", () => { progressQuiet = false; });
+  const progressBody = () => {
+    const body = { position: video.currentTime || 0, duration: video.duration };
+    if (manualStatus) body.keep_watched = true;
+    return body;
+  };
   const reportProgress = () => {
-    if (leftPage || !video.duration || isNaN(video.duration)) return;
-    api.post(`/api/video/${id}/progress`, {
-      position: video.currentTime || 0, duration: video.duration,
+    if (leftPage || progressQuiet || !video.duration || isNaN(video.duration)) return;
+    const sentAt = manualChanges;
+    api.post(`/api/video/${id}/progress`, progressBody()).then((r) => {
+      // The server decides when a video becomes watched (at 90%). Mirror that
+      // on the page, so the button offers the right action once it happens.
+      if (leftPage || sentAt !== manualChanges) return;
+      v.watched = r.watched;
+      v.position = r.position;
+      syncWatchedUi();
     }).catch(() => {});
   };
   let lastSave = 0;
   video.addEventListener("timeupdate", () => {
+    if (manualStatus && video.duration && video.currentTime < video.duration * WATCHED_DONE) {
+      manualStatus = false;
+    }
     const now = Date.now();
     if (now - lastSave > 5000) { lastSave = now; reportProgress(); }
   });
@@ -1800,12 +1831,9 @@ async function renderVideo(id) {
   video.addEventListener("ended", reportProgress);
   // Flush on tab close via a beacon (survives page unload).
   const beacon = () => {
-    if (leftPage || !video.duration || isNaN(video.duration)) return;
+    if (leftPage || progressQuiet || !video.duration || isNaN(video.duration)) return;
     try {
-      const blob = new Blob(
-        [JSON.stringify({ position: video.currentTime || 0, duration: video.duration })],
-        { type: "application/json" }
-      );
+      const blob = new Blob([JSON.stringify(progressBody())], { type: "application/json" });
       navigator.sendBeacon(`/api/video/${id}/progress`, blob);
     } catch (e) {}
   };
@@ -1868,8 +1896,9 @@ async function renderVideo(id) {
   mountPlayer();
 
   // ── Resume bar ──
+  let resumeBar = null;
   if (resumeAt) {
-    const bar = el("div", { class: "resume-bar" }, [
+    const bar = resumeBar = el("div", { class: "resume-bar" }, [
       el("span", { class: "rb-text" }, `You stopped at ${fmtDuration(resumeAt)}`),
       el("div", { class: "resume-actions" }, [
         el("button", { class: "btn primary", onClick: () => { seekAndPlay(resumeAt); bar.remove(); } },
@@ -1973,12 +2002,19 @@ async function renderVideo(id) {
     ["Date added", fmtDateAbs(v.added_at)],
     ["Last played", fmtDate(v.last_played)],
     ["Play count", String(v.play_count)],
-    ["Status", v.watched ? "Watched" : (v.position > 0 ? `In progress (${fmtDuration(v.position)})` : "Not watched")],
   ];
   const table = el("table", { class: "meta-table" });
   rows.forEach(([k, val]) => {
     table.appendChild(el("tr", {}, [el("td", {}, k), el("td", {}, val)]));
   });
+  // Status gets its own cell: the watched button below rewrites it.
+  const statusCell = el("td", {});
+  const syncStatus = () => {
+    statusCell.textContent = v.watched ? "Watched"
+      : (v.position > 0 ? `In progress (${fmtDuration(v.position)})` : "Not watched");
+  };
+  syncStatus();
+  table.appendChild(el("tr", {}, [el("td", {}, "Status"), statusCell]));
   left.appendChild(table);
 
   // history
@@ -2010,6 +2046,35 @@ async function renderVideo(id) {
     } catch (e) { toast("Could not update favorite"); }
   });
   right.appendChild(favBtn);
+
+  // ── Watched toggle ──
+  const watchedLabel = el("span", {});
+  const watchedBtn = el("button", {
+    class: "btn watched-toggle",
+    style: "width:100%;justify-content:center;margin-bottom:14px",
+  }, [el("span", { html: ICON.check }), watchedLabel]);
+  const syncWatchedBtn = () => {
+    watchedBtn.classList.toggle("on", !!v.watched);
+    watchedLabel.textContent = v.watched ? "Watched" : "Mark as watched";
+    watchedBtn.title = v.watched ? "Click to mark as unwatched" : "";
+  };
+  syncWatchedBtn();
+  watchedBtn.addEventListener("click", async () => {
+    const newVal = !v.watched;
+    try {
+      const r = await api.post(`/api/video/${id}/watched`, { value: newVal });
+      v.watched = r.watched;
+      v.position = r.position;
+      manualStatus = true;
+      manualChanges += 1;
+      progressQuiet = video.paused || video.ended;
+      if (resumeBar) { resumeBar.remove(); resumeBar = null; }   // its resume point is gone
+      syncWatchedUi();
+      toast(newVal ? "Marked as watched" : "Marked as unwatched");
+    } catch (e) { toast("Could not update watched status"); }
+  });
+  right.appendChild(watchedBtn);
+  syncWatchedUi = () => { syncWatchedBtn(); syncStatus(); };
 
   // ── Tags: current tags + autocomplete input + popular tag chips ──
   let allTags = [];

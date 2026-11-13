@@ -125,6 +125,9 @@ More options in [Run with Docker](#run-with-docker). No Docker? See
 - **Watched tracking** — a video counts as watched at 90%; watching 5% or less
   doesn't count and leaves no resume point. Cards show a Watched badge, or a
   progress bar when partially watched
+- **Mark as watched / unwatched** — a button on the video page sets the status of
+  a single video by hand. Either way the resume point is cleared; play history
+  (last played, play count, the Watched page) is left as it is
 - **Watch history** — every play is timestamped, with last-played shown on cards
   and the detail page. The **Watched** page lists the last 100 played
 - **New** — the 100 most recently *added* videos, by when they entered the

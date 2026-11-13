@@ -320,6 +320,9 @@ select.theme { height: 38px; padding: 0 10px; border-radius: var(--radius);
 .btn.fav.on { background: var(--danger); color: var(--accent-ink); border-color: var(--danger); }
 .btn.fav.on svg { fill: var(--accent-ink); stroke: var(--accent-ink); }
 .btn.fav.on:hover { filter: brightness(1.06); }
+/* watched toggle on the video page: filled when the video counts as watched */
+.btn.watched-toggle.on { background: var(--success); color: var(--accent-ink); border-color: var(--success); }
+.btn.watched-toggle.on:hover { filter: brightness(1.06); }
 
 /* Watched badge + resume progress bar on cards */
 .badge.watched { left: 8px; right: auto; bottom: 8px; display: inline-flex; align-items: center;

@@ -1140,8 +1140,13 @@ def api_progress(video_id: int, payload: dict = Body(...)):
         dur = duration or (row["duration"] or 0)
         frac = (position / dur) if dur > 0 else 0.0
         watched = bool(row["watched"])
+        # The video page sends keep_watched once the status has been set by
+        # hand during the visit: the resume point is still tracked, but playing
+        # on past 90% mustn't quietly undo a "mark as unwatched".
+        keep_watched = bool(payload.get("keep_watched"))
         if frac >= WATCHED_DONE_FRACTION:
-            watched = True
+            if not keep_watched:
+                watched = True
             new_position = 0.0          # finished → start over next time
         elif frac <= WATCHED_MIN_FRACTION:
             new_position = 0.0          # too little watched → not resumeable
@@ -1149,6 +1154,22 @@ def api_progress(video_id: int, payload: dict = Body(...)):
             new_position = position     # keep a resume point
         db.set_watch_state(conn, video_id, new_position, watched)
     return {"position": new_position, "watched": watched, "fraction": round(frac, 4)}
+
+
+@app.post("/api/video/{video_id}/watched")
+def api_set_watched(video_id: int, payload: dict = Body(...)):
+    """Mark one video as watched or unwatched by hand. Either way the resume
+    point is cleared, the same as finishing it: "watched" plays from the start
+    next time, and "unwatched" means not started rather than in progress.
+    Play history (last played, play count, the Watched page) is left alone."""
+    value = payload.get("value", True)
+    if not isinstance(value, bool):
+        raise HTTPException(400, "value must be true or false")
+    with db.get_db() as conn:
+        if not db.get_video(conn, video_id):
+            raise HTTPException(404, "Video not found")
+        db.set_watch_state(conn, video_id, 0.0, value)
+    return {"watched": value, "position": 0.0}
 
 
 @app.get("/api/new")
